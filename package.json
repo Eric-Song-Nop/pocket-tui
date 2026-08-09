@@ -9,7 +9,7 @@
   "scripts": {
     "check": "cargo check --workspace && bun run typecheck",
     "typecheck": "tsc --noEmit",
-    "build:native": "cargo build -p pocket-tui-napi --release",
+    "build:native": "cargo build -p pocket-tui-napi --release && node scripts/link-native.mjs",
     "build": "bun run build:native && bun run typecheck"
   },
   "devDependencies": {
@@ -20,4 +20,3 @@
     "bun": ">=1.2"
   }
 }
-
