@@ -32,6 +32,8 @@ pub enum DirtyReason {
     StyleChanged,
     ActiveChanged,
     ChildChanged,
+    DocumentAppended,
+    DocumentSealed,
 }
 
 impl DirtyReason {
@@ -44,6 +46,7 @@ impl DirtyReason {
             Self::StyleChanged => DirtyMask::PAINT,
             Self::ActiveChanged => DirtyMask::ALL,
             Self::ChildChanged => DirtyMask::VISUAL.union(DirtyMask::CHILDREN),
+            Self::DocumentAppended | Self::DocumentSealed => DirtyMask::PAINT,
         }
     }
 }

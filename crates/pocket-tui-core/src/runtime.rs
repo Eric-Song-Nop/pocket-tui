@@ -5,9 +5,10 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    AuxId, BoxNode, Cell, DirtyMask, GraphemeStore, LayoutSpec, Length, NodeId, NodeKind, Rect,
-    ResourceError, ResourceSnapshot, RowDamage, SceneDb, SceneError, Screen, ScreenError,
-    ScreenRow, ScreenSnapshot, Size, Style, StyleId, StyleStore,
+    AuxId, BlockId, BoxNode, Cell, DirtyMask, DirtyReason, DocumentDb, DocumentError, DocumentId,
+    DocumentStats, GraphemeStore, LayoutSpec, Length, NodeId, NodeKind, Rect, ResourceError,
+    ResourceSnapshot, RowDamage, SceneDb, SceneError, Screen, ScreenError, ScreenRow,
+    ScreenSnapshot, Size, Style, StyleId, StyleStore, TranscriptNode,
 };
 
 /// Monotonic native frame generation.
@@ -25,6 +26,18 @@ pub struct FrameArtifact {
     pub resources: ResourceSnapshot,
 }
 
+/// Runtime and document memory counters exposed to bindings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeStats {
+    pub documents: usize,
+    pub blocks: usize,
+    pub open_blocks: usize,
+    pub document_text_bytes: usize,
+    pub document_budget_bytes: usize,
+    pub estimated_document_rows: u64,
+    pub estimated_native_bytes: usize,
+}
+
 impl FrameArtifact {
     /// True when no terminal cell changed.
     pub fn is_empty(&self) -> bool {
@@ -36,6 +49,7 @@ impl FrameArtifact {
 #[derive(Clone, Debug)]
 pub struct Runtime {
     scene: SceneDb,
+    documents: DocumentDb,
     graphemes: GraphemeStore,
     styles: StyleStore,
     screen: Screen,
@@ -49,6 +63,7 @@ impl Runtime {
     pub fn new(size: Size) -> Self {
         Self {
             scene: SceneDb::default(),
+            documents: DocumentDb::default(),
             graphemes: GraphemeStore::default(),
             styles: StyleStore::default(),
             // Begin dimensionless so the first commit is an explicit full
@@ -58,6 +73,13 @@ impl Runtime {
             size_dirty: true,
             frame_generation: FrameGeneration(0),
         }
+    }
+
+    /// Creates a runtime with an explicit aggregate document UTF-8 cap.
+    pub fn with_document_budget(size: Size, hard_byte_budget: usize) -> Self {
+        let mut runtime = Self::new(size);
+        runtime.documents = DocumentDb::new(hard_byte_budget);
+        runtime
     }
 
     pub const fn size(&self) -> Size {
@@ -78,6 +100,76 @@ impl Runtime {
 
     pub fn scene_mut(&mut self) -> &mut SceneDb {
         &mut self.scene
+    }
+
+    pub const fn documents(&self) -> &DocumentDb {
+        &self.documents
+    }
+
+    pub fn create_document(&mut self) -> Result<DocumentId, RuntimeError> {
+        Ok(self.documents.create_document()?)
+    }
+
+    pub fn open_block(&mut self, document: DocumentId) -> Result<BlockId, RuntimeError> {
+        Ok(self.documents.open_block(document)?)
+    }
+
+    pub fn append_block_text(&mut self, block: BlockId, text: &str) -> Result<(), RuntimeError> {
+        let document = self.documents.block(block)?.document();
+        self.documents.append_text(block, text)?;
+        self.scene
+            .mark_document(document, DirtyReason::DocumentAppended)?;
+        Ok(())
+    }
+
+    pub fn seal_block(&mut self, block: BlockId) -> Result<(), RuntimeError> {
+        let document = self.documents.block(block)?.document();
+        self.documents.seal_block(block)?;
+        self.scene
+            .mark_document(document, DirtyReason::DocumentSealed)?;
+        Ok(())
+    }
+
+    pub fn create_transcript(
+        &mut self,
+        parent: Option<NodeId>,
+        node: TranscriptNode,
+    ) -> Result<NodeId, RuntimeError> {
+        self.documents.document(node.document)?;
+        if !node.follow_tail {
+            return Err(RuntimeError::UnsupportedTranscriptMode);
+        }
+        Ok(self.scene.create_transcript(parent, node)?)
+    }
+
+    pub fn stats(&self) -> RuntimeStats {
+        let DocumentStats {
+            documents,
+            blocks,
+            open_blocks,
+            text_bytes,
+            hard_byte_budget,
+            estimated_rows,
+        } = self.documents.stats();
+        RuntimeStats {
+            documents,
+            blocks,
+            open_blocks,
+            document_text_bytes: text_bytes,
+            document_budget_bytes: hard_byte_budget,
+            estimated_document_rows: estimated_rows,
+            estimated_native_bytes: self.memory_bytes(),
+        }
+    }
+
+    /// Conservative bytes retained by core-owned stores and the current grid.
+    pub fn memory_bytes(&self) -> usize {
+        self.documents
+            .memory_bytes()
+            .saturating_add(self.scene.memory_bytes())
+            .saturating_add(self.screen.memory_bytes())
+            .saturating_add(self.graphemes.memory_bytes())
+            .saturating_add(self.styles.memory_bytes())
     }
 
     pub const fn graphemes(&self) -> &GraphemeStore {
@@ -135,6 +227,9 @@ impl Runtime {
         }
         let natural = match node.kind() {
             NodeKind::Text(text) => measure_text(&text.text, available, text.wrap),
+            NodeKind::Transcript(transcript) => {
+                apply_layout(transcript.layout, available, available)
+            }
             NodeKind::Box(box_node) => {
                 let inner = Size::new(
                     available.columns.saturating_sub(
@@ -318,6 +413,35 @@ impl Runtime {
             NodeKind::Text(text) => {
                 paint_text(node.rect(), text, rows, self.size, &mut self.graphemes)?;
             }
+            NodeKind::Transcript(transcript) => {
+                let lines = self.documents.materialize_tail(
+                    transcript.document,
+                    node.rect().width,
+                    node.rect().height,
+                    transcript.block_gap,
+                )?;
+                let top = node.rect().bottom().saturating_sub(lines.len() as u16);
+                for (offset, line) in lines.into_iter().enumerate() {
+                    let text = crate::TextNode {
+                        text: line.text,
+                        style: transcript.style,
+                        layout: LayoutSpec::default(),
+                        wrap: false,
+                    };
+                    paint_text(
+                        Rect::new(
+                            node.rect().column.0,
+                            top + offset as u16,
+                            node.rect().width,
+                            1,
+                        ),
+                        &text,
+                        rows,
+                        self.size,
+                        &mut self.graphemes,
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -442,4 +566,8 @@ pub enum RuntimeError {
     Screen(#[from] ScreenError),
     #[error(transparent)]
     Resource(#[from] ResourceError),
+    #[error(transparent)]
+    Document(#[from] DocumentError),
+    #[error("the MVP transcript primitive supports follow-tail mode only")]
+    UnsupportedTranscriptMode,
 }

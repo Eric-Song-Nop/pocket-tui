@@ -311,6 +311,15 @@ impl Screen {
             rows: Arc::new(self.rows.iter().map(ScreenRow::snapshot).collect()),
         }
     }
+
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.rows.capacity() * core::mem::size_of::<ScreenRow>()
+            + self
+                .rows
+                .iter()
+                .map(|row| row.cells.len() * core::mem::size_of::<Cell>())
+                .sum::<usize>()
+    }
 }
 
 /// Screen mutation failure.

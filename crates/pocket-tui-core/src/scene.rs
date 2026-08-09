@@ -2,7 +2,9 @@
 
 use thiserror::Error;
 
-use crate::{Axis, DirtyMask, DirtyReason, DirtyState, Insets, LayoutSpec, Rect, StyleId};
+use crate::{
+    Axis, DirtyMask, DirtyReason, DirtyState, DocumentId, Insets, LayoutSpec, Rect, StyleId,
+};
 
 /// Opaque generational scene handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -80,11 +82,34 @@ impl TextNode {
     }
 }
 
+/// Virtual transcript bound directly to native document history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptNode {
+    pub document: DocumentId,
+    pub style: StyleId,
+    pub layout: LayoutSpec,
+    pub follow_tail: bool,
+    pub block_gap: u16,
+}
+
+impl TranscriptNode {
+    pub fn new(document: DocumentId) -> Self {
+        Self {
+            document,
+            style: StyleId::DEFAULT,
+            layout: LayoutSpec::FILL,
+            follow_tail: true,
+            block_gap: 1,
+        }
+    }
+}
+
 /// Primitive-specific node data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeKind {
     Box(BoxNode),
     Text(TextNode),
+    Transcript(TranscriptNode),
 }
 
 /// One active or retained scene node.
@@ -131,6 +156,7 @@ impl Node {
         match &self.kind {
             NodeKind::Box(node) => node.layout,
             NodeKind::Text(node) => node.layout,
+            NodeKind::Transcript(node) => node.layout,
         }
     }
 }
@@ -173,6 +199,14 @@ impl SceneDb {
         value: TextNode,
     ) -> Result<NodeId, SceneError> {
         self.create(parent, NodeKind::Text(value))
+    }
+
+    pub fn create_transcript(
+        &mut self,
+        parent: Option<NodeId>,
+        value: TranscriptNode,
+    ) -> Result<NodeId, SceneError> {
+        self.create(parent, NodeKind::Transcript(value))
     }
 
     fn create(&mut self, parent: Option<NodeId>, kind: NodeKind) -> Result<NodeId, SceneError> {
@@ -308,10 +342,54 @@ impl SceneDb {
             .fold(DirtyMask::empty(), |mask, node| mask | node.dirty.mask())
     }
 
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.slots.capacity() * core::mem::size_of::<Slot>()
+            + self.free.capacity() * core::mem::size_of::<u32>()
+            + self.roots.capacity() * core::mem::size_of::<NodeId>()
+            + self
+                .slots
+                .iter()
+                .filter_map(|slot| slot.node.as_ref())
+                .map(|node| {
+                    node.children.capacity() * core::mem::size_of::<NodeId>()
+                        + match &node.kind {
+                            NodeKind::Text(text) => text.text.capacity(),
+                            NodeKind::Box(_) | NodeKind::Transcript(_) => 0,
+                        }
+                })
+                .sum::<usize>()
+    }
+
     pub(crate) fn clear_dirty(&mut self) {
         for node in self.slots.iter_mut().filter_map(|slot| slot.node.as_mut()) {
             node.dirty.clear();
         }
+    }
+
+    pub(crate) fn mark_document(
+        &mut self,
+        document: DocumentId,
+        reason: DirtyReason,
+    ) -> Result<(), SceneError> {
+        let ids: Vec<NodeId> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| match slot.node.as_ref()?.kind() {
+                NodeKind::Transcript(node) if node.document == document => {
+                    Some(NodeId::new(index as u32, slot.generation))
+                }
+                _ => None,
+            })
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let generation = self.bump_generation();
+        for id in ids {
+            self.mark(id, reason, generation)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn set_rect(&mut self, id: NodeId, rect: Rect) -> Result<(), SceneError> {

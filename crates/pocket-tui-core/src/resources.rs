@@ -118,6 +118,15 @@ impl GraphemeStore {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.entries.capacity() * core::mem::size_of::<Grapheme>()
+            + self
+                .entries
+                .iter()
+                .map(|entry| entry.text.len())
+                .sum::<usize>()
+    }
 }
 
 /// Append-only, deduplicating style catalog.
@@ -163,6 +172,10 @@ impl StyleStore {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.entries.capacity() * core::mem::size_of::<Style>()
     }
 }
 
