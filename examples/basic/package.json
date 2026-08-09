@@ -2,8 +2,10 @@
   "name": "@pocket-tui/example-basic",
   "private": true,
   "type": "module",
+  "scripts": {
+    "start": "bun index.ts"
+  },
   "dependencies": {
     "@pocket-tui/core": "workspace:*"
   }
 }
-

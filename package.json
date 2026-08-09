@@ -7,10 +7,11 @@
     "examples/*"
   ],
   "scripts": {
-    "check": "cargo check --workspace && bun run typecheck",
+    "check": "cargo check --workspace && tsc --noEmit",
     "typecheck": "tsc --noEmit",
+    "build:ts": "tsc -p packages/core/tsconfig.json",
     "build:native": "cargo build -p pocket-tui-napi --release && node scripts/link-native.mjs",
-    "build": "bun run build:native && bun run typecheck"
+    "build": "cargo build -p pocket-tui-napi --release && node scripts/link-native.mjs && tsc -p packages/core/tsconfig.json"
   },
   "devDependencies": {
     "typescript": "^5.9.0"
