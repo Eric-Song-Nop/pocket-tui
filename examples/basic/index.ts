@@ -1,25 +1,59 @@
-import { createTui } from "@pocket-tui/core";
+import { createTui, type TuiInputEvent } from "@pocket-tui/core";
 
 const app = createTui({ surface: "alternate" });
-const root = app.box({ direction: "column", border: true, padding: 1 });
-const title = root.text("PocketTUI PTX1 / N-API MVP");
-const stream = root.text("Streaming: ");
-root.text("The demo closes and restores the terminal automatically.");
+const transcript = app.transcript();
+const root = app.box({ direction: "column", padding: 1 });
+root.virtualTranscript(transcript);
+const footer = root.text("Streaming through native DocumentDB…");
 app.mount(root);
 
 await app.start();
 try {
-  for (const chunk of ["semantic ", "delta ", "→ ", "native ", "scene"] as const) {
-    stream.appendText(chunk);
+  const block = transcript.openBlock();
+  for (const chunk of [
+    "PocketTUI ",
+    "keeps this block ",
+    "in DocumentDB ",
+    "and appends ordered UTF-8 deltas.",
+  ] as const) {
+    block.appendText(chunk);
     await app.flush("terminal");
-    await delay(160);
+    await delay(140);
   }
-
-  title.setText("PocketTUI alternate-screen demo");
+  block.seal();
   await app.flush("terminal");
-  await delay(900);
+
+  const stats = app.memoryStats();
+  footer.setText(
+    `blocks=${stats.blocks} sealed=${stats.sealedBlocks} text=${stats.documentTextBytes}B · press any key`,
+  );
+  await app.flush("terminal");
+
+  const event = await waitForInput(1_500);
+  if (event !== undefined) {
+    footer.setText(`input: ${describeInput(event)} · closing`);
+    await app.flush("terminal");
+    await delay(180);
+  }
 } finally {
   await app.close();
+}
+
+async function waitForInput(timeoutMs: number): Promise<TuiInputEvent | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const event = app.pollInput()[0];
+    if (event !== undefined) return event;
+    await delay(16);
+  }
+  return undefined;
+}
+
+function describeInput(event: TuiInputEvent): string {
+  if (event.kind === "key") return event.key;
+  if (event.kind === "resize") return `${event.columns}×${event.rows}`;
+  if (event.kind === "text" || event.kind === "paste-chunk") return event.text;
+  return event.kind;
 }
 
 function delay(milliseconds: number): Promise<void> {

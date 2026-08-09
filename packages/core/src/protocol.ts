@@ -14,6 +14,11 @@ export const enum PtxOpcode {
   SetText = 5,
   AppendText = 6,
   RemoveNode = 7,
+  CreateTranscript = 8,
+  OpenBlock = 9,
+  AppendBlockText = 10,
+  SealBlock = 11,
+  CreateVirtualTranscript = 12,
 }
 
 export type BoxDirection = "column" | "row";
@@ -31,7 +36,12 @@ export type DecodedPtxOperation =
   | { opcode: PtxOpcode.SetRoot; handle: bigint }
   | { opcode: PtxOpcode.SetText; handle: bigint; text: string }
   | { opcode: PtxOpcode.AppendText; handle: bigint; text: string }
-  | { opcode: PtxOpcode.RemoveNode; handle: bigint };
+  | { opcode: PtxOpcode.RemoveNode; handle: bigint }
+  | { opcode: PtxOpcode.CreateTranscript; handle: bigint }
+  | { opcode: PtxOpcode.OpenBlock; transcript: bigint; block: bigint }
+  | { opcode: PtxOpcode.AppendBlockText; handle: bigint; text: string }
+  | { opcode: PtxOpcode.SealBlock; handle: bigint }
+  | { opcode: PtxOpcode.CreateVirtualTranscript; handle: bigint; transcript: bigint };
 
 export interface DecodedPtxPacket {
   major: number;
@@ -104,6 +114,26 @@ export class PtxPacketEncoder {
     return this.#handleRecord(PtxOpcode.RemoveNode, handle);
   }
 
+  createTranscript(handle: bigint): this {
+    return this.#handleRecord(PtxOpcode.CreateTranscript, handle);
+  }
+
+  openBlock(transcript: bigint, block: bigint): this {
+    return this.#twoHandleRecord(PtxOpcode.OpenBlock, transcript, block);
+  }
+
+  appendBlockText(block: bigint, text: string): this {
+    return this.#textRecord(PtxOpcode.AppendBlockText, block, text);
+  }
+
+  sealBlock(block: bigint): this {
+    return this.#handleRecord(PtxOpcode.SealBlock, block);
+  }
+
+  createVirtualTranscript(handle: bigint, transcript: bigint): this {
+    return this.#twoHandleRecord(PtxOpcode.CreateVirtualTranscript, handle, transcript);
+  }
+
   finish(): Uint8Array {
     const byteLength = PTX_HEADER_BYTES + this.#records.reduce((sum, record) => sum + record.byteLength, 0);
     if (byteLength > PTX_MAX_PACKET_BYTES) {
@@ -131,6 +161,16 @@ export class PtxPacketEncoder {
     assertHandle(handle);
     const payload = new Uint8Array(8);
     dataView(payload).setBigUint64(0, handle, true);
+    return this.#record(opcode, payload);
+  }
+
+  #twoHandleRecord(opcode: PtxOpcode, first: bigint, second: bigint): this {
+    assertHandle(first);
+    assertHandle(second);
+    const payload = new Uint8Array(16);
+    const view = dataView(payload);
+    view.setBigUint64(0, first, true);
+    view.setBigUint64(8, second, true);
     return this.#record(opcode, payload);
   }
 
@@ -246,13 +286,15 @@ function decodeOperation(
     }
     case PtxOpcode.CreateText:
     case PtxOpcode.SetText:
-    case PtxOpcode.AppendText: {
+    case PtxOpcode.AppendText:
+    case PtxOpcode.AppendBlockText: {
       ensurePayload(payloadLength, 16);
       const textLength = view.getUint32(payloadOffset + 8, true);
       ensurePayload(payloadLength, 16 + textLength);
       const text = decoder.decode(packet.subarray(payloadOffset + 16, payloadOffset + 16 + textLength));
       if (opcode === PtxOpcode.CreateText) return { opcode, handle: handle(), text };
       if (opcode === PtxOpcode.SetText) return { opcode, handle: handle(), text };
+      if (opcode === PtxOpcode.AppendText) return { opcode, handle: handle(), text };
       return { opcode, handle: handle(), text };
     }
     case PtxOpcode.AppendChild:
@@ -266,6 +308,24 @@ function decodeOperation(
       return { opcode, handle: handle() };
     case PtxOpcode.RemoveNode:
       return { opcode, handle: handle() };
+    case PtxOpcode.CreateTranscript:
+      return { opcode, handle: handle() };
+    case PtxOpcode.OpenBlock:
+      ensurePayload(payloadLength, 16);
+      return {
+        opcode,
+        transcript: view.getBigUint64(payloadOffset, true),
+        block: view.getBigUint64(payloadOffset + 8, true),
+      };
+    case PtxOpcode.SealBlock:
+      return { opcode, handle: handle() };
+    case PtxOpcode.CreateVirtualTranscript:
+      ensurePayload(payloadLength, 16);
+      return {
+        opcode,
+        handle: view.getBigUint64(payloadOffset, true),
+        transcript: view.getBigUint64(payloadOffset + 8, true),
+      };
     default:
       throw new PtxDecodeError(`unknown required opcode ${opcode}`);
   }

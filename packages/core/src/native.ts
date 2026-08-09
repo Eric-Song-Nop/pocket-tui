@@ -5,8 +5,31 @@ export interface NativeTuiSession {
   submit(packet: Uint8Array): string;
   start(): void;
   flush(): void;
+  pollInput(): NativeInputEvent[];
+  memoryStats(): NativeMemoryStats;
   close(): void;
 }
+
+export interface NativeMemoryStats {
+  sceneNodes: number;
+  documents: number;
+  blocks: number;
+  openBlocks: number;
+  sealedBlocks: number;
+  documentTextBytes: number;
+  documentBudgetBytes: number;
+  estimatedDocumentRows: number;
+  estimatedNativeBytes: number;
+  terminalPendingBytes: number;
+}
+
+export type NativeInputEvent =
+  | { kind: "text"; text: string }
+  | { kind: "key"; key: string; ctrl: boolean; alt: boolean; shift: boolean }
+  | { kind: "paste-start" }
+  | { kind: "paste-chunk"; text: string }
+  | { kind: "paste-end" }
+  | { kind: "resize"; columns: number; rows: number };
 
 export interface NativeBinding {
   NativeTui: new () => NativeTuiSession;

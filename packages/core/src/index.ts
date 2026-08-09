@@ -5,11 +5,16 @@ export {
   BoxHandle,
   SceneHandle,
   TextHandle,
+  TranscriptBlockHandle,
+  TranscriptHandle,
   TuiApp,
+  VirtualTranscriptHandle,
   createTui,
   type CreateTuiOptions,
   type FlushMode,
   type TuiAppState,
+  type TuiInputEvent,
+  type TuiMemoryStats,
 } from "./app.js";
 export {
   PTX_HEADER_BYTES,
@@ -26,4 +31,10 @@ export {
   type DecodedPtxOperation,
   type DecodedPtxPacket,
 } from "./protocol.js";
-export { loadNativeBinding, type NativeBinding, type NativeTuiSession } from "./native.js";
+export {
+  loadNativeBinding,
+  type NativeBinding,
+  type NativeInputEvent,
+  type NativeMemoryStats,
+  type NativeTuiSession,
+} from "./native.js";

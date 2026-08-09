@@ -1,8 +1,16 @@
-import { loadNativeBinding, type NativeBinding, type NativeTuiSession } from "./native.js";
+import {
+  loadNativeBinding,
+  type NativeBinding,
+  type NativeInputEvent,
+  type NativeMemoryStats,
+  type NativeTuiSession,
+} from "./native.js";
 import { PtxPacketEncoder, type BoxPacketOptions } from "./protocol.js";
 
 export type FlushMode = "accepted" | "painted" | "terminal";
 export type TuiAppState = "created" | "active" | "closed";
+export type TuiInputEvent = NativeInputEvent;
+export type TuiMemoryStats = Readonly<NativeMemoryStats>;
 
 export interface CreateTuiOptions {
   /** Alternate-screen is the only MVP surface. */
@@ -20,7 +28,12 @@ type Command =
   | { kind: "setRoot"; handle: bigint }
   | { kind: "setText"; handle: bigint; text: string }
   | { kind: "appendText"; handle: bigint; text: string }
-  | { kind: "removeNode"; handle: bigint };
+  | { kind: "removeNode"; handle: bigint }
+  | { kind: "createTranscript"; handle: bigint }
+  | { kind: "openBlock"; transcript: bigint; block: bigint }
+  | { kind: "appendBlockText"; block: bigint; text: string }
+  | { kind: "sealBlock"; block: bigint }
+  | { kind: "createVirtualTranscript"; handle: bigint; transcript: bigint };
 
 export abstract class SceneHandle {
   readonly id: bigint;
@@ -79,6 +92,12 @@ export class BoxHandle extends SceneHandle {
     this.append(child);
     return child;
   }
+
+  virtualTranscript(transcript: TranscriptHandle): VirtualTranscriptHandle {
+    const child = this._owner().virtualTranscript(transcript);
+    this.append(child);
+    return child;
+  }
 }
 
 export class TextHandle extends SceneHandle {
@@ -97,6 +116,70 @@ export class TextHandle extends SceneHandle {
     this._assertLive();
     this._owner()._appendText(this.id, text);
     return this;
+  }
+}
+
+export class VirtualTranscriptHandle extends SceneHandle {
+  readonly transcript: TranscriptHandle;
+
+  /** @internal */
+  constructor(app: TuiApp, id: bigint, transcript: TranscriptHandle) {
+    super(app, id);
+    this.transcript = transcript;
+  }
+}
+
+export class TranscriptHandle {
+  readonly id: bigint;
+  readonly #app: TuiApp;
+
+  /** @internal */
+  constructor(app: TuiApp, id: bigint) {
+    this.#app = app;
+    this.id = id;
+  }
+
+  openBlock(): TranscriptBlockHandle {
+    this.#app._assertOpen();
+    return this.#app._openBlock(this);
+  }
+
+  /** @internal */
+  _owner(): TuiApp {
+    return this.#app;
+  }
+}
+
+export class TranscriptBlockHandle {
+  readonly id: bigint;
+  readonly transcript: TranscriptHandle;
+  #sealed = false;
+
+  /** @internal */
+  constructor(id: bigint, transcript: TranscriptHandle) {
+    this.id = id;
+    this.transcript = transcript;
+  }
+
+  get sealed(): boolean {
+    return this.#sealed;
+  }
+
+  appendText(text: string): this {
+    this.#assertOpen();
+    this.transcript._owner()._appendBlockText(this.id, text);
+    return this;
+  }
+
+  seal(): void {
+    this.#assertOpen();
+    this.transcript._owner()._sealBlock(this.id);
+    this.#sealed = true;
+  }
+
+  #assertOpen(): void {
+    this.transcript._owner()._assertOpen();
+    if (this.#sealed) throw new Error(`Transcript block ${this.id} is sealed`);
   }
 }
 
@@ -136,6 +219,23 @@ export class TuiApp {
     return new TextHandle(this, handle);
   }
 
+  transcript(): TranscriptHandle {
+    this._assertOpen();
+    const handle = this.#allocateHandle();
+    this.#enqueue({ kind: "createTranscript", handle });
+    return new TranscriptHandle(this, handle);
+  }
+
+  virtualTranscript(transcript: TranscriptHandle): VirtualTranscriptHandle {
+    this._assertOpen();
+    if (transcript._owner() !== this) {
+      throw new TypeError("Transcript handle is owned by another TuiApp");
+    }
+    const handle = this.#allocateHandle();
+    this.#enqueue({ kind: "createVirtualTranscript", handle, transcript: transcript.id });
+    return new VirtualTranscriptHandle(this, handle, transcript);
+  }
+
   mount(root: SceneHandle): this {
     root._assertLive();
     if (root._owner() !== this) throw new TypeError("Root handle is owned by another TuiApp");
@@ -172,6 +272,33 @@ export class TuiApp {
     this.#native?.flush();
   }
 
+  /** Drain all terminal input currently available without blocking. */
+  pollInput(): TuiInputEvent[] {
+    this._assertOpen();
+    this.#throwAsyncError();
+    return this.#native?.pollInput() ?? [];
+  }
+
+  /** Snapshot byte/count telemetry owned by the native runtime. */
+  memoryStats(): TuiMemoryStats {
+    this._assertOpen();
+    this.#throwAsyncError();
+    return Object.freeze(
+      this.#native?.memoryStats() ?? {
+        sceneNodes: 0,
+        documents: 0,
+        blocks: 0,
+        openBlocks: 0,
+        sealedBlocks: 0,
+        documentTextBytes: 0,
+        documentBudgetBytes: 0,
+        estimatedDocumentRows: 0,
+        estimatedNativeBytes: 0,
+        terminalPendingBytes: 0,
+      },
+    );
+  }
+
   async close(): Promise<void> {
     if (this.#state === "closed") return;
     this.#commitScheduled = false;
@@ -203,6 +330,26 @@ export class TuiApp {
   /** @internal */
   _remove(handle: bigint): void {
     this.#enqueue({ kind: "removeNode", handle });
+  }
+
+  /** @internal */
+  _openBlock(transcript: TranscriptHandle): TranscriptBlockHandle {
+    if (transcript._owner() !== this) {
+      throw new TypeError("Transcript handle is owned by another TuiApp");
+    }
+    const block = this.#allocateHandle();
+    this.#enqueue({ kind: "openBlock", transcript: transcript.id, block });
+    return new TranscriptBlockHandle(block, transcript);
+  }
+
+  /** @internal */
+  _appendBlockText(block: bigint, text: string): void {
+    this.#enqueue({ kind: "appendBlockText", block, text });
+  }
+
+  /** @internal */
+  _sealBlock(block: bigint): void {
+    this.#enqueue({ kind: "sealBlock", block });
   }
 
   /** @internal */
@@ -283,6 +430,21 @@ function encodeCommand(encoder: PtxPacketEncoder, command: Command): void {
       break;
     case "removeNode":
       encoder.removeNode(command.handle);
+      break;
+    case "createTranscript":
+      encoder.createTranscript(command.handle);
+      break;
+    case "openBlock":
+      encoder.openBlock(command.transcript, command.block);
+      break;
+    case "appendBlockText":
+      encoder.appendBlockText(command.block, command.text);
+      break;
+    case "sealBlock":
+      encoder.sealBlock(command.block);
+      break;
+    case "createVirtualTranscript":
+      encoder.createVirtualTranscript(command.handle, command.transcript);
       break;
   }
 }

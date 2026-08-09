@@ -18,6 +18,11 @@ pub enum Opcode {
     SetText = 5,
     AppendText = 6,
     RemoveNode = 7,
+    CreateTranscript = 8,
+    OpenBlock = 9,
+    AppendBlockText = 10,
+    SealBlock = 11,
+    CreateVirtualTranscript = 12,
 }
 
 impl TryFrom<u16> for Opcode {
@@ -32,6 +37,11 @@ impl TryFrom<u16> for Opcode {
             5 => Ok(Self::SetText),
             6 => Ok(Self::AppendText),
             7 => Ok(Self::RemoveNode),
+            8 => Ok(Self::CreateTranscript),
+            9 => Ok(Self::OpenBlock),
+            10 => Ok(Self::AppendBlockText),
+            11 => Ok(Self::SealBlock),
+            12 => Ok(Self::CreateVirtualTranscript),
             _ => Err(DecodeError::new(format!("unknown required opcode {value}"))),
         }
     }
@@ -72,6 +82,24 @@ pub enum Operation<'a> {
     },
     RemoveNode {
         handle: u64,
+    },
+    CreateTranscript {
+        handle: u64,
+    },
+    OpenBlock {
+        transcript: u64,
+        block: u64,
+    },
+    AppendBlockText {
+        block: u64,
+        text: &'a str,
+    },
+    SealBlock {
+        block: u64,
+    },
+    CreateVirtualTranscript {
+        handle: u64,
+        transcript: u64,
     },
 }
 
@@ -211,6 +239,35 @@ fn decode_operation(opcode: Opcode, payload: &[u8]) -> Result<Operation<'_>, Dec
             require_payload(payload, 8)?;
             Ok(Operation::RemoveNode {
                 handle: read_u64(payload, 0)?,
+            })
+        }
+        Opcode::CreateTranscript => {
+            require_payload(payload, 8)?;
+            Ok(Operation::CreateTranscript {
+                handle: read_u64(payload, 0)?,
+            })
+        }
+        Opcode::OpenBlock => {
+            require_payload(payload, 16)?;
+            Ok(Operation::OpenBlock {
+                transcript: read_u64(payload, 0)?,
+                block: read_u64(payload, 8)?,
+            })
+        }
+        Opcode::AppendBlockText => decode_text_operation(payload, |block, text| {
+            Operation::AppendBlockText { block, text }
+        }),
+        Opcode::SealBlock => {
+            require_payload(payload, 8)?;
+            Ok(Operation::SealBlock {
+                block: read_u64(payload, 0)?,
+            })
+        }
+        Opcode::CreateVirtualTranscript => {
+            require_payload(payload, 16)?;
+            Ok(Operation::CreateVirtualTranscript {
+                handle: read_u64(payload, 0)?,
+                transcript: read_u64(payload, 8)?,
             })
         }
     }
