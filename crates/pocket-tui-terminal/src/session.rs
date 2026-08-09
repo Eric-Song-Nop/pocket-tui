@@ -10,6 +10,7 @@ use thiserror::Error;
 use crate::capability::TerminalCapabilities;
 use crate::encoder::{EncodeError, encode_transition, resolve_frame};
 use crate::guard::TerminalGuard;
+use crate::input::{InputError, InputEvent, TerminalInput};
 use crate::state::{PhysicalState, ScreenModel};
 use crate::transport::FdWriter;
 
@@ -22,6 +23,9 @@ pub enum TerminalError {
     /// A core frame violated a terminal paint invariant.
     #[error(transparent)]
     Encode(#[from] EncodeError),
+    /// Input parsing or nonblocking descriptor setup failed.
+    #[error(transparent)]
+    Input(#[from] InputError),
     /// A frame older than the latest desired/confirmed generation was submitted.
     #[error("stale frame generation {submitted}; latest generation is {latest}")]
     StaleGeneration { submitted: u64, latest: u64 },
@@ -31,6 +35,9 @@ pub enum TerminalError {
     /// The session was already closed.
     #[error("terminal session is closed")]
     Closed,
+    /// The session was constructed without a terminal input descriptor.
+    #[error("terminal input is not attached to this session")]
+    InputUnavailable,
 }
 
 /// Observable progress of the desired/in-flight/confirmed state machine.
@@ -72,6 +79,7 @@ struct InFlight {
 pub struct TerminalSession<W: Write> {
     writer: W,
     capabilities: TerminalCapabilities,
+    input: Option<TerminalInput>,
     guard: Option<TerminalGuard>,
     confirmed: PhysicalState,
     desired: Option<Arc<ScreenModel>>,
@@ -89,6 +97,7 @@ impl<W: Write> TerminalSession<W> {
         Self {
             writer,
             capabilities,
+            input: None,
             guard: None,
             confirmed: PhysicalState::empty(),
             desired: None,
@@ -97,8 +106,14 @@ impl<W: Write> TerminalSession<W> {
         }
     }
 
-    fn with_guard(writer: W, capabilities: TerminalCapabilities, guard: TerminalGuard) -> Self {
+    fn with_guard(
+        writer: W,
+        capabilities: TerminalCapabilities,
+        input: TerminalInput,
+        guard: TerminalGuard,
+    ) -> Self {
         let mut session = Self::new(writer, capabilities);
+        session.input = Some(input);
         session.guard = Some(guard);
         session
     }
@@ -151,9 +166,7 @@ impl<W: Write> TerminalSession<W> {
         if !progress.is_idle() {
             return Err(TerminalError::OutputPending);
         }
-        if let Some(guard) = &mut self.guard {
-            guard.restore()?;
-        }
+        self.restore_terminal()?;
         self.closed = true;
         Ok(())
     }
@@ -185,6 +198,14 @@ impl<W: Write> TerminalSession<W> {
         } else {
             Ok(())
         }
+    }
+
+    fn restore_terminal(&mut self) -> Result<(), TerminalError> {
+        let input_result = self.input.as_mut().map_or(Ok(()), TerminalInput::restore);
+        let guard_result = self.guard.as_mut().map_or(Ok(()), TerminalGuard::restore);
+        input_result?;
+        guard_result?;
+        Ok(())
     }
 
     fn drive(&mut self) -> Result<SessionProgress, TerminalError> {
@@ -234,11 +255,28 @@ impl TerminalSession<FdWriter> {
     /// Enter raw mode and the alternate screen on stdin/stdout.
     pub fn open_stdio(capabilities: TerminalCapabilities) -> Result<Self, TerminalError> {
         let guard = TerminalGuard::stdio()?;
+        let input = TerminalInput::stdio()?;
         Ok(Self::with_guard(
             FdWriter::new(libc::STDOUT_FILENO),
             capabilities,
+            input,
             guard,
         ))
+    }
+
+    /// Drain currently available stdin bytes into typed events without waiting.
+    pub fn read_available(&mut self) -> Result<Vec<InputEvent>, TerminalError> {
+        self.ensure_open()?;
+        self.input
+            .as_mut()
+            .ok_or(TerminalError::InputUnavailable)?
+            .read_available()
+            .map_err(Into::into)
+    }
+
+    /// Alias used by event loops to poll nonblocking terminal input.
+    pub fn poll_input(&mut self) -> Result<Vec<InputEvent>, TerminalError> {
+        self.read_available()
     }
 
     /// Wait for stdout readiness until the latest desired frame is confirmed.
@@ -258,9 +296,7 @@ impl TerminalSession<FdWriter> {
             return Ok(());
         }
         self.flush_blocking()?;
-        if let Some(guard) = &mut self.guard {
-            guard.restore()?;
-        }
+        self.restore_terminal()?;
         self.closed = true;
         Ok(())
     }
@@ -269,6 +305,14 @@ impl TerminalSession<FdWriter> {
     #[must_use]
     pub fn output_fd(&self) -> RawFd {
         self.writer.raw_fd()
+    }
+
+    /// Borrowed stdin descriptor used for readability registration.
+    pub fn input_fd(&self) -> Result<RawFd, TerminalError> {
+        self.input
+            .as_ref()
+            .map(TerminalInput::input_fd)
+            .ok_or(TerminalError::InputUnavailable)
     }
 }
 
