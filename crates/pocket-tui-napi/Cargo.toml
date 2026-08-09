@@ -1,0 +1,19 @@
+[package]
+name = "pocket-tui-napi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi.workspace = true
+napi-derive.workspace = true
+pocket-tui-core = { path = "../pocket-tui-core" }
+pocket-tui-terminal = { path = "../pocket-tui-terminal" }
+
+[build-dependencies]
+napi-build = "2"
+

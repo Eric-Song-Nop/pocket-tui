@@ -1,0 +1,9 @@
+{
+  "name": "@pocket-tui/example-basic",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@pocket-tui/core": "workspace:*"
+  }
+}
+

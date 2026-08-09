@@ -1,0 +1,13 @@
+[package]
+name = "pocket-tui-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+bitflags.workspace = true
+thiserror.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+

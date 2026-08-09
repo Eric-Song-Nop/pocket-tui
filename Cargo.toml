@@ -1,0 +1,28 @@
+[workspace]
+members = [
+  "crates/pocket-tui-core",
+  "crates/pocket-tui-terminal",
+  "crates/pocket-tui-napi",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/Eric-Song-Nop/pocket-tui"
+
+[workspace.dependencies]
+bitflags = "2"
+libc = "0.2"
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+thiserror = "2"
+unicode-segmentation = "1"
+unicode-width = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+

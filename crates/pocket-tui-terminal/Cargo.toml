@@ -1,0 +1,12 @@
+[package]
+name = "pocket-tui-terminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc.workspace = true
+pocket-tui-core = { path = "../pocket-tui-core" }
+thiserror.workspace = true
+
