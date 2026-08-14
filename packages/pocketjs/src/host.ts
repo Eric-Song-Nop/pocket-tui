@@ -64,6 +64,7 @@ export interface PocketTuiNodeSnapshot {
   readonly children: readonly number[];
   readonly text: string;
   readonly styleId: number;
+  readonly focused: boolean;
   readonly active: boolean;
   readonly rect?: Rect;
 }
@@ -175,6 +176,14 @@ export class PocketTuiHost {
     return Object.freeze({ ...this.#viewport });
   }
 
+  /** Return the latest laid-out cell rectangle for a live PocketJS node. */
+  nodeRect(id: number): Readonly<Rect> | undefined {
+    this.#assertOpen();
+    this.#node(id);
+    const rect = this.#lastLayout?.entries.get(id)?.rect;
+    return rect === undefined ? undefined : Object.freeze({ ...rect });
+  }
+
   resize(columns: number, rows: number): void {
     this.#assertOpen();
     const next = validateViewport({ columns, rows });
@@ -281,6 +290,7 @@ export class PocketTuiHost {
         children: node.children.map((child) => child.id),
         text: node.text,
         styleId: node.styleId,
+        focused: node.id === this.#focused,
         active: node.active,
         rect: this.#lastLayout?.entries.get(node.id)?.rect,
       });

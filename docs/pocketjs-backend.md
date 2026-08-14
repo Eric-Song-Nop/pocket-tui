@@ -57,6 +57,9 @@ The backend implements PocketJS `view`, `text`, and `image` nodes with:
   depth of 64;
 - parent/child ordering, detach, move, recursive destroy, focus, active state,
   and paint-order hit testing;
+- PocketJS document-order focus traversal, focus scopes/grids, detach repair,
+  active press state, and small headless `Button`, `Checkbox`, and `TextInput`
+  components;
 - PocketJS v2 style tables with base, focus, and active variants;
 - cell flex rows and columns, grow/shrink/basis, min/max dimensions, gap,
   padding, margin, absolute positioning, clipping, display, and z-order;
@@ -117,9 +120,13 @@ text event into a pulse before applying the queue policy; a later quit or
 action character is therefore not hidden by an earlier movement character.
 
 The default mapper covers arrows, WASD/HJKL, Space/P, `.`, R/Enter,
-Q/Escape/Ctrl-C, and Backspace. Applications can replace it with `mapInput` or
-inspect and consume events first with `onInput`. Resize events are applied when
-the fixed-rate input poll observes them.
+Q/Escape/Ctrl-C, and Backspace. A focused `Button` specializes Enter to CIRCLE
+without changing Enter's START mapping elsewhere. A focused `TextInput`
+consumes text, paste chunks, editing keys, and submit before button mapping,
+and anchors the real terminal cursor after layout. Applications can replace
+button mapping with `mapInput` or inspect and consume events first with
+`onInput`. Resize events are applied when the fixed-rate input poll observes
+them.
 
 For deterministic tests or external scheduling, call `session.step()` directly
 instead of `session.run()`.

@@ -36,6 +36,13 @@ export {
   untrack,
 } from "solid-js/dist/solid.js";
 export { BTN } from "@pocketjs/framework/input";
+export {
+  focusNode,
+  getFocused,
+  pushFocusController,
+  pushFocusGrid,
+  pushFocusScope,
+} from "@pocketjs/framework/input";
 export { simulationHz, virtualNow } from "@pocketjs/framework/clock";
 export {
   createSpriteAnimation,

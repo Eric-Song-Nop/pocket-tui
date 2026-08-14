@@ -43,6 +43,9 @@ The MVP is intentionally narrower than the complete design in [`docs/architectur
 ### PocketJS 0.6 reference backend
 
 - `@pocket-tui/pocketjs` implements the real PocketJS 0.6 `HostOps` contract. PocketJS and Solid own signals, components, button handlers, and frame lifecycle; the backend owns a validated retained shadow tree.
+- The PocketJS package exposes the runtime's document-order focus manager,
+  scopes/grids, detach repair, and headless terminal `Button`, `Checkbox`, and
+  grapheme-aware `TextInput` components with a real cursor anchor.
 - Host mutations are laid out in terminal cells and rasterized into compact, terminal-independent Canvas runs. The backend—not the game—owns `CanvasHandle.present()`, PTX1 transport, and the handoff to Rust damage tracking.
 - The reference backend supports an explicit conservative `ansi16` mode and an opt-in `truecolor` mode. It does not probe terminal color capabilities.
 - Terminal input becomes bounded Pocket button pulses, with a latest-direction policy for real-time apps or an ordered queue for turn-based apps, plus one release frame after each press. The session is currently a fixed-rate loop rather than the target event-driven scheduler.
