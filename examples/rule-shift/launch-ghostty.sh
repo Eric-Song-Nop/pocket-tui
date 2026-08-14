@@ -17,6 +17,11 @@ if [ ! -r "$shader_path" ]; then
 fi
 
 system_name=$(uname -s)
+if [ "$system_name" = Darwin ]; then
+    shader_y_down=1
+else
+    shader_y_down=0
+fi
 if [ "$system_name" = Darwin ] && [ -x /Applications/Ghostty.app/Contents/MacOS/ghostty ]; then
     ghostty_binary=/Applications/Ghostty.app/Contents/MacOS/ghostty
 elif command -v ghostty >/dev/null 2>&1; then
@@ -52,8 +57,11 @@ set -- \
     --custom-shader= \
     "--custom-shader=$shader_path" \
     --custom-shader-animation=true \
+    --window-padding-x=0 \
+    --window-padding-y=0 \
     "--working-directory=$example_dir" \
     --env=POCKET_TUI_GHOSTTY_EFFECTS=1 \
+    "--env=POCKET_TUI_GHOSTTY_Y_DOWN=$shader_y_down" \
     -e "$bun_path" run start "$@"
 
 if [ "$system_name" = Darwin ]; then

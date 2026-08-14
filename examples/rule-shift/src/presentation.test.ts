@@ -393,6 +393,7 @@ describe("print choreography and retained telemetry", () => {
     expect(rewind.cues.map((cue) => cue.kind)).toEqual(["calibrate"]);
     expect(rewind.durationMs).toBeGreaterThanOrEqual(PRINT_DURATIONS.calibrate);
     expect(rewind.trace).toEqual(["carriage returned / proof restored"]);
+    expect(rewind.cues[0]?.transition).toBe("undo");
   });
 
   test("samples transform and win cues deterministically within their bounds", () => {
@@ -408,6 +409,69 @@ describe("print choreography and retained telemetry", () => {
     expect(active.every((cue) => cue.progress >= 0 && cue.progress < 1)).toBe(true);
     expect(samplePrintTimeline(timeline, 200 + timeline.durationMs)).toEqual([]);
     expect(schedulePrintTimeline(events, 200)).toEqual(timeline);
+  });
+
+  test("retains semantic direction when a higher-priority overlapping cue delays publication", () => {
+    const snapshot = createRuleGame().snapshot();
+    const timeline: PrintTimeline = {
+      startedAt: 0,
+      durationMs: 220,
+      trace: [],
+      cues: [
+        {
+          id: "earlier-push",
+          kind: "push",
+          startsAt: 0,
+          durationMs: 180,
+          anchor: { x: 2, y: 2 },
+          from: { x: 1, y: 2 },
+          to: { x: 2, y: 2 },
+        },
+        {
+          id: "delayed-move",
+          kind: "move",
+          startsAt: 100,
+          durationMs: 120,
+          anchor: { x: 3, y: 2 },
+          from: { x: 2, y: 2 },
+          to: { x: 3, y: 2 },
+        },
+      ],
+    };
+
+    expect(present(snapshot, timeline, { columns: 108, rows: 38 }, 120).effectSignal)
+      .toMatchObject({ kind: "push", direction: "right" });
+    expect(present(snapshot, timeline, { columns: 108, rows: 38 }, 190).effectSignal)
+      .toMatchObject({ kind: "move", direction: "right" });
+  });
+
+  test("binds lifecycle semantics to the selected cue instead of stale trace copy", () => {
+    const snapshot = createRuleGame().snapshot();
+    const timeline: PrintTimeline = {
+      startedAt: 0,
+      durationMs: 680,
+      trace: ["carriage returned / proof restored", "new rule locked"],
+      cues: [
+        {
+          id: "old-undo",
+          kind: "calibrate",
+          startsAt: 0,
+          durationMs: 680,
+          anchor: { x: 1, y: 1 },
+          transition: "undo",
+        },
+        {
+          id: "new-rule",
+          kind: "calibrate",
+          startsAt: 100,
+          durationMs: 540,
+          anchor: { x: 3, y: 2 },
+        },
+      ],
+    };
+
+    expect(present(snapshot, timeline, { columns: 108, rows: 38 }, 200).effectSignal)
+      .toMatchObject({ kind: "calibrate", startedAt: 100, transition: undefined });
   });
 
   test("publishes transform before the remaining calibration tail on the effect bus", () => {

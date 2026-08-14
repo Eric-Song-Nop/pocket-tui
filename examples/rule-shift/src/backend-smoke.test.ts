@@ -20,7 +20,15 @@ import {
   RuleShift,
   type RuleShiftContext,
 } from "./game-app.js";
-import { isImmediateQuit, ruleShiftInputMap } from "./main.js";
+import {
+  GHOSTTY_DIRECTION_CODES,
+  GHOSTTY_EFFECT_FLAGS,
+  deriveGhosttyEffectSemantics,
+  encodeGhosttyEffectChannels,
+  ghosttyEffectKey,
+  isImmediateQuit,
+  ruleShiftInputMap,
+} from "./main.js";
 import type { PresentationScene, PresentationViewport } from "./presentation.js";
 
 class DemoSurface implements PocketTuiSurface {
@@ -217,6 +225,100 @@ describe("RULE//SHIFT PocketJS backend integration", () => {
     expect(isImmediateQuit({ kind: "key", key: "c", ctrl: true })).toBe(true);
   });
 
+  test("encodes direction, phase, anchor, rules, campaign state, and undo on the typed Ghostty bus", () => {
+    const snapshot = effectSnapshot({
+      levelId: "freight",
+      levelIndex: 2,
+      levelCount: 5,
+      turn: 6,
+      historyDepth: 3,
+      phase: "won",
+      ruleCount: 4,
+    });
+    const scene = effectScene({
+      kind: "blocked",
+      progress: 0.25,
+      anchor: { column: 18, row: 13 },
+      cursor: { column: 20, row: 10 },
+      direction: "down",
+      transition: "undo",
+      trace: "carriage returned / proof restored",
+    });
+    const previous = {
+      cursor: { column: 20, row: 10 },
+    };
+    const semantics = deriveGhosttyEffectSemantics(scene.effectSignal, scene, previous);
+
+    expect(semantics).toEqual({
+      direction: "down",
+      undo: true,
+      stageChange: false,
+      restart: false,
+      initialLoad: false,
+    });
+    expect(encodeGhosttyEffectChannels(scene.effectSignal, scene, snapshot, semantics, true)).toEqual([
+      [
+        3,
+        203,
+        GHOSTTY_EFFECT_FLAGS.won | GHOSTTY_EFFECT_FLAGS.undo | GHOSTTY_EFFECT_FLAGS.yDown,
+      ],
+      [64, 150, 24],
+      [126, 131, GHOSTTY_DIRECTION_CODES.down * 32 + 16],
+    ]);
+    expect(encodeGhosttyEffectChannels(scene.effectSignal, scene, snapshot, semantics, false)[0]?.[2])
+      .toBe(GHOSTTY_EFFECT_FLAGS.won | GHOSTTY_EFFECT_FLAGS.undo);
+
+    const hiddenScene = effectScene({
+      kind: "blocked",
+      progress: 0.25,
+      anchor: { column: 7, row: 5 },
+      cursor: { column: 39, row: 23 },
+      cursorVisible: false,
+      direction: "left",
+      trace: "cropped anchor",
+    });
+    const hiddenChannels = encodeGhosttyEffectChannels(
+      hiddenScene.effectSignal,
+      hiddenScene,
+      snapshot,
+      deriveGhosttyEffectSemantics(hiddenScene.effectSignal, hiddenScene),
+      true,
+    );
+    expect(hiddenChannels[0]?.[2] & GHOSTTY_EFFECT_FLAGS.absoluteAnchor)
+      .toBe(GHOSTTY_EFFECT_FLAGS.absoluteAnchor);
+    expect(hiddenChannels[2]?.slice(0, 2)).toEqual([7, 5]);
+
+    const staleTrace = effectScene({
+      kind: "calibrate",
+      progress: 0.1,
+      anchor: { column: 20, row: 10 },
+      cursor: { column: 20, row: 10 },
+      trace: "carriage returned / proof restored",
+    });
+    expect(deriveGhosttyEffectSemantics(staleTrace.effectSignal, staleTrace, previous))
+      .toMatchObject({ undo: false, restart: false, stageChange: false, initialLoad: false });
+
+    const loadScene = effectScene({
+      kind: "calibrate",
+      progress: 0,
+      anchor: { column: 42, row: 17 },
+      cursor: { column: 42, row: 17 },
+      transition: "stage-change",
+      trace: "forme seated / pins aligned",
+    });
+    expect(deriveGhosttyEffectSemantics(loadScene.effectSignal, loadScene, previous))
+      .toMatchObject({ stageChange: true, initialLoad: false, direction: "none" });
+    expect(deriveGhosttyEffectSemantics(
+      { ...loadScene.effectSignal, transition: "initial-load" },
+      loadScene,
+    ))
+      .toMatchObject({ stageChange: false, initialLoad: true, direction: "none" });
+    expect(ghosttyEffectKey(loadScene.effectSignal)).not.toBe(ghosttyEffectKey({
+      ...loadScene.effectSignal,
+      transition: "restart",
+    }));
+  });
+
   test("renders movement and rule transformation as multi-frame portable particles", async () => {
     const movement = await recordAnimation("freight", "d", 7);
     const beforePlayer = movement.before.cells.find((cell) => cell.id === "entity-freight-player");
@@ -379,4 +481,71 @@ function textNodeId(
   text: string,
 ): number | undefined {
   return nodes.find((node) => node.text === text)?.id;
+}
+
+function effectSnapshot(options: {
+  levelId: string;
+  levelIndex: number;
+  levelCount: number;
+  turn: number;
+  historyDepth: number;
+  phase: "playing" | "won";
+  ruleCount: number;
+}): GameSnapshot {
+  return {
+    ...options,
+    title: options.levelId,
+    hint: "",
+    width: 8,
+    height: 8,
+    entities: [],
+    rules: {
+      clauses: Array.from({ length: options.ruleCount }, (_, index) => ({ key: `rule-${index}` })),
+      properties: [],
+      transformations: [],
+    },
+  } as GameSnapshot;
+}
+
+function effectScene(options: {
+  kind: PresentationScene["effectSignal"]["kind"];
+  progress: number;
+  anchor: { column: number; row: number };
+  cursor: { column: number; row: number };
+  cursorVisible?: boolean;
+  direction?: "up" | "right" | "down" | "left";
+  transition?: "initial-load" | "undo" | "restart" | "stage-change";
+  trace: string;
+}): PresentationScene {
+  return {
+    layout: { viewport: { column: 0, row: 0, width: 40, height: 24 } },
+    cursor: {
+      ...options.cursor,
+      visible: options.cursorVisible ?? true,
+      shape: "underline",
+      token: "cyan",
+    },
+    effectSignal: {
+      kind: options.kind,
+      progress: options.progress,
+      anchor: options.anchor,
+      token: "cyan",
+      startedAt: 100,
+      durationMs: 240,
+      direction: options.direction,
+      transition: options.transition,
+    },
+    panels: [{
+      id: "trace",
+      rect: { column: 0, row: 0, width: 40, height: 1 },
+      texts: [{
+        id: "trace.0",
+        column: 0,
+        row: 0,
+        text: options.trace,
+        token: "lead",
+      }],
+      rules: [],
+    }],
+  } as PresentationScene;
 }
