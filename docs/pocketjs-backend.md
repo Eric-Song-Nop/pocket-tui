@@ -5,11 +5,11 @@ PocketTUI. It lets PocketJS keep ownership of component state and lifecycle
 while PocketTUI owns the terminal surface, native scene, damage tracking, and
 ANSI output.
 
-This is the backend used by the flagship **Signal Below** roguelike. The game
-does not import `CellBuffer`, create a PocketTUI `Canvas`, or write ANSI. Its
-application layer creates retained PocketJS text and view nodes. Canvas is an
-internal boundary used by the backend after those nodes have been laid out and
-rasterized.
+This is the backend used by the **RULE//SHIFT** rule-rewriting puzzle campaign
+and the **Signal Below** roguelike. Neither game imports `CellBuffer`, creates a
+PocketTUI `Canvas`, or writes ANSI. Their application layers create retained
+PocketJS text and view nodes. Canvas is an internal boundary used by the
+backend after those nodes have been laid out and rasterized.
 
 ## Data path
 
@@ -101,11 +101,15 @@ terminal receives the complete cell-rendered game without it.
 
 Terminal input is edge-based, so one mapped button pulse is followed by one
 release frame. The effective repeated-press rate is therefore at most half the
-configured frame rate. Pending pulses are bounded to eight. Pending direction
-repeats are coalesced with latest-direction-wins behavior; if non-directional
-input exceeds the bound, the oldest pending pulse is discarded. The adapter
-uses a neutral analog value and does not synthesize key-held state because the
-terminal does not provide matching key-up events.
+configured frame rate. Pending pulses are bounded to eight. The default
+`directionPulsePolicy: "latest"` coalesces all pending directions when a newer
+direction arrives, preventing stale terminal autorepeat from replaying after a
+key is released. `directionPulsePolicy: "queue"` instead preserves directions
+in arrival order for discrete, turn-based controls. Under either policy,
+overflow discards the oldest pending pulse. The option accepts only `"latest"`
+or `"queue"`; invalid runtime values fail before mounting or starting a
+surface. The adapter uses a neutral analog value and does not synthesize
+key-held state because the terminal does not provide matching key-up events.
 
 One mapper result may be a single button mask or a sequence of at most eight.
 The default mapper turns every recognized character in one batched terminal
@@ -173,7 +177,7 @@ workspace's compiler settings. The executable adapter currently requires Bun:
 PocketJS 0.6 publishes TypeScript source in its npm artifact, which ordinary
 Node does not execute from `node_modules`.
 
-## Build and run the flagship demo
+## Build and run the demos
 
 From the repository root:
 
@@ -200,3 +204,17 @@ The launcher requires Ghostty 1.3 or newer and does not edit global Ghostty
 configuration. See the [Signal Below README](../examples/roguelike/README.md)
 for controls and its [dedicated Ghostty document](../examples/roguelike/GHOSTTY.md)
 for shader-specific details.
+
+The rule-puzzle campaign exercises the same HostOps path with a deterministic
+word-rule engine, stable retained node pools, immediate rule recomputation,
+undo/restart/level transitions, responsive layout, and signal-driven print
+effects:
+
+```bash
+cd examples/rule-shift
+bun run start
+```
+
+Use `bun run ghostty` in that directory for the optional Syntax Loom pass. Its
+portable terminal frame remains the complete game; the shader is only a typed,
+reversible effect-bus consumer.

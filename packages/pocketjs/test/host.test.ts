@@ -271,6 +271,19 @@ describe("PocketTUI session drives the real PocketJS frame lifecycle", () => {
     ).rejects.toThrow(/fps must be one of/);
   });
 
+  test("rejects an unknown direction pulse policy before touching the surface", async () => {
+    const surface = new FakeSurface();
+    await expect(
+      mountPocketTui(() => createElement("view"), {
+        surface,
+        directionPulsePolicy: "fifo" as never,
+      }),
+    ).rejects.toThrow(/directionPulsePolicy must be one of latest, queue/);
+    expect(surface.started).toBe(0);
+    expect(surface.flushed).toBe(0);
+    expect(surface.closed).toBe(0);
+  });
+
   test("rejects concurrent sessions and releases the runtime lease after close", async () => {
     const first = await mountPocketTui(() => createElement("view"), {
       surface: new FakeSurface(),
@@ -464,6 +477,105 @@ describe("PocketTUI session drives the real PocketJS frame lifecycle", () => {
     for (let frame = 0; frame < 20; frame += 1) tail.push((await session.step()).buttons);
     expect(tail.filter((buttons) => buttons === POCKET_BUTTON.SQUARE)).toHaveLength(8);
     expect(tail.slice(-4)).toEqual([0, 0, 0, 0]);
+
+    await session.close();
+  });
+
+  test("optionally queues repeated and mixed directions as ordered press/release edges", async () => {
+    const surface = new FakeSurface({ columns: 12, rows: 4 });
+    const edges: number[] = [];
+    const session = await mountPocketTui(
+      () => {
+        const root = createElement("view");
+        for (const button of [
+          POCKET_BUTTON.UP,
+          POCKET_BUTTON.RIGHT,
+          POCKET_BUTTON.DOWN,
+          POCKET_BUTTON.LEFT,
+        ]) {
+          onButtonPress(button, () => edges.push(button));
+        }
+        return root;
+      },
+      { surface, directionPulsePolicy: "queue" },
+    );
+
+    const liveNodes = session.diagnostics.liveNodes;
+    const rootId = session.host.snapshot().find((node) => node.parent === 0)?.id;
+
+    surface.inputs.push({ kind: "text", text: "aaaa" });
+    const repeated: number[] = [];
+    for (let frame = 0; frame < 8; frame += 1) {
+      repeated.push((await session.step()).buttons);
+    }
+    expect(repeated).toEqual([
+      POCKET_BUTTON.LEFT,
+      0,
+      POCKET_BUTTON.LEFT,
+      0,
+      POCKET_BUTTON.LEFT,
+      0,
+      POCKET_BUTTON.LEFT,
+      0,
+    ]);
+
+    surface.inputs.push({ kind: "text", text: "wasd" });
+    const mixed: number[] = [];
+    for (let frame = 0; frame < 8; frame += 1) mixed.push((await session.step()).buttons);
+    expect(mixed).toEqual([
+      POCKET_BUTTON.UP,
+      0,
+      POCKET_BUTTON.LEFT,
+      0,
+      POCKET_BUTTON.DOWN,
+      0,
+      POCKET_BUTTON.RIGHT,
+      0,
+    ]);
+    expect(edges).toEqual([
+      POCKET_BUTTON.LEFT,
+      POCKET_BUTTON.LEFT,
+      POCKET_BUTTON.LEFT,
+      POCKET_BUTTON.LEFT,
+      POCKET_BUTTON.UP,
+      POCKET_BUTTON.LEFT,
+      POCKET_BUTTON.DOWN,
+      POCKET_BUTTON.RIGHT,
+    ]);
+
+    edges.length = 0;
+    for (const key of [
+      "arrow-up",
+      "arrow-right",
+      "arrow-down",
+      "arrow-left",
+      "arrow-up",
+      "arrow-right",
+      "arrow-down",
+      "arrow-left",
+      "arrow-right",
+    ]) {
+      surface.inputs.push({
+        kind: "key",
+        key,
+        ctrl: false,
+        alt: false,
+        shift: false,
+      });
+    }
+    for (let frame = 0; frame < 16; frame += 1) await session.step();
+    expect(edges).toEqual([
+      POCKET_BUTTON.RIGHT,
+      POCKET_BUTTON.DOWN,
+      POCKET_BUTTON.LEFT,
+      POCKET_BUTTON.UP,
+      POCKET_BUTTON.RIGHT,
+      POCKET_BUTTON.DOWN,
+      POCKET_BUTTON.LEFT,
+      POCKET_BUTTON.RIGHT,
+    ]);
+    expect(session.diagnostics.liveNodes).toBe(liveNodes);
+    expect(session.host.snapshot().find((node) => node.parent === 0)?.id).toBe(rootId);
 
     await session.close();
   });

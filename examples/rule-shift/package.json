@@ -1,0 +1,13 @@
+{
+  "name": "@pocket-tui/example-rule-shift",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun src/main.ts",
+    "ghostty": "./launch-ghostty.sh",
+    "test": "bun test src/engine.test.ts src/presentation.test.ts src/backend-smoke.test.ts"
+  },
+  "dependencies": {
+    "@pocket-tui/pocketjs": "workspace:*"
+  }
+}
