@@ -1,8 +1,11 @@
 /** PocketTUI package version. */
 export const version = "0.1.0";
 
+export { CellBuffer, type CellBufferCell } from "./canvas.js";
+
 export {
   BoxHandle,
+  CanvasHandle,
   SceneHandle,
   TextHandle,
   TranscriptBlockHandle,
@@ -11,10 +14,12 @@ export {
   VirtualTranscriptHandle,
   createTui,
   type CreateTuiOptions,
+  type EffectBusFrame,
   type FlushMode,
   type TuiAppState,
   type TuiInputEvent,
   type TuiMemoryStats,
+  type TuiViewportSize,
 } from "./app.js";
 export {
   PTX_HEADER_BYTES,
@@ -28,8 +33,17 @@ export {
   decodePtx,
   type BoxDirection,
   type BoxPacketOptions,
+  type CanvasFrame,
+  type CanvasRun,
+  type CursorPacketOptions,
+  type CursorShape,
+  type EffectBusChannel,
+  type EffectBusPacketOptions,
+  type EffectBusProfile,
   type DecodedPtxOperation,
   type DecodedPtxPacket,
+  type TuiColor,
+  type TuiStyle,
 } from "./protocol.js";
 export {
   loadNativeBinding,
@@ -37,4 +51,5 @@ export {
   type NativeInputEvent,
   type NativeMemoryStats,
   type NativeTuiSession,
+  type NativeViewportSize,
 } from "./native.js";

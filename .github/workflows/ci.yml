@@ -18,3 +18,7 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: cargo check --workspace
       - run: bun run typecheck
+      - run: bun run build:ts
+      - run: bun run --cwd packages/core pack:check
+      - run: bun run --cwd packages/pocketjs pack:check
+      - run: bun run test

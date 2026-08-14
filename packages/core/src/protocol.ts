@@ -19,6 +19,10 @@ export const enum PtxOpcode {
   AppendBlockText = 10,
   SealBlock = 11,
   CreateVirtualTranscript = 12,
+  CreateCanvas = 13,
+  SetCanvasFrame = 14,
+  SetCursor = 15,
+  SetEffectBus = 16,
 }
 
 export type BoxDirection = "column" | "row";
@@ -27,6 +31,60 @@ export interface BoxPacketOptions {
   direction?: BoxDirection;
   border?: boolean;
   padding?: number;
+}
+
+export type TuiColor =
+  | { readonly kind: "default" }
+  | { readonly kind: "indexed"; readonly index: number }
+  | { readonly kind: "rgb"; readonly red: number; readonly green: number; readonly blue: number };
+
+export interface TuiStyle {
+  readonly foreground?: TuiColor;
+  readonly background?: TuiColor;
+  readonly bold?: boolean;
+  readonly dim?: boolean;
+  readonly italic?: boolean;
+  readonly underline?: boolean;
+  readonly blink?: boolean;
+  readonly reverse?: boolean;
+  readonly hidden?: boolean;
+  readonly strikethrough?: boolean;
+}
+
+export interface CanvasRun {
+  readonly row: number;
+  readonly column: number;
+  readonly text: string;
+  readonly style?: TuiStyle;
+}
+
+export interface CanvasFrame {
+  readonly width: number;
+  readonly height: number;
+  readonly runs: readonly CanvasRun[];
+}
+
+export type CursorShape = "block" | "underline" | "bar";
+
+export interface CursorPacketOptions {
+  readonly row: number;
+  readonly column: number;
+  readonly visible?: boolean;
+  /** Steady terminal cursor shape. Defaults to `block`. */
+  readonly shape?: CursorShape;
+  readonly color?: TuiColor;
+}
+
+export type EffectBusProfile = "ghostty-palette-v1";
+export type EffectBusChannel = readonly [red: number, green: number, blue: number];
+
+/** Three opaque 24-bit channels transported through a negotiated terminal effect profile. */
+export interface EffectBusPacketOptions {
+  readonly profile: EffectBusProfile;
+  readonly enabled?: boolean;
+  /** Restart the profile's event clock even when the channels did not change. */
+  readonly trigger?: boolean;
+  readonly channels?: readonly [EffectBusChannel, EffectBusChannel, EffectBusChannel];
 }
 
 export type DecodedPtxOperation =
@@ -41,7 +99,11 @@ export type DecodedPtxOperation =
   | { opcode: PtxOpcode.OpenBlock; transcript: bigint; block: bigint }
   | { opcode: PtxOpcode.AppendBlockText; handle: bigint; text: string }
   | { opcode: PtxOpcode.SealBlock; handle: bigint }
-  | { opcode: PtxOpcode.CreateVirtualTranscript; handle: bigint; transcript: bigint };
+  | { opcode: PtxOpcode.CreateVirtualTranscript; handle: bigint; transcript: bigint }
+  | { opcode: PtxOpcode.CreateCanvas; handle: bigint }
+  | { opcode: PtxOpcode.SetCanvasFrame; handle: bigint; frame: CanvasFrame }
+  | { opcode: PtxOpcode.SetCursor; options: Required<CursorPacketOptions> }
+  | { opcode: PtxOpcode.SetEffectBus; options: Required<EffectBusPacketOptions> };
 
 export interface DecodedPtxPacket {
   major: number;
@@ -52,6 +114,11 @@ export interface DecodedPtxPacket {
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
+const ZERO_EFFECT_CHANNELS = [
+  [0, 0, 0],
+  [0, 0, 0],
+  [0, 0, 0],
+] as const satisfies readonly [EffectBusChannel, EffectBusChannel, EffectBusChannel];
 
 /**
  * Builds one self-contained PTX1 packet. Handles and strings are values, never
@@ -132,6 +199,112 @@ export class PtxPacketEncoder {
 
   createVirtualTranscript(handle: bigint, transcript: bigint): this {
     return this.#twoHandleRecord(PtxOpcode.CreateVirtualTranscript, handle, transcript);
+  }
+
+  createCanvas(handle: bigint): this {
+    return this.#handleRecord(PtxOpcode.CreateCanvas, handle);
+  }
+
+  setCanvasFrame(handle: bigint, frame: CanvasFrame): this {
+    assertHandle(handle);
+    assertU16(frame.width, "canvas width");
+    assertU16(frame.height, "canvas height");
+    if (frame.width === 0 || frame.height === 0) {
+      throw new RangeError("canvas dimensions must be non-zero");
+    }
+    if (!Number.isInteger(frame.runs.length) || frame.runs.length > 0xffff_ffff) {
+      throw new RangeError("canvas run count exceeds u32");
+    }
+
+    const encodedRuns = frame.runs.map((run, index) => {
+      assertU16(run.row, `canvas run ${index} row`);
+      assertU16(run.column, `canvas run ${index} column`);
+      if (run.row >= frame.height || run.column >= frame.width) {
+        throw new RangeError(`canvas run ${index} starts outside the frame`);
+      }
+      if (run.text.length === 0) throw new RangeError(`canvas run ${index} is empty`);
+      if (/\r|\n/u.test(run.text)) {
+        throw new RangeError(`canvas run ${index} contains a line break`);
+      }
+      const text = encoder.encode(run.text);
+      if (text.byteLength > 0xffff_ffff) {
+        throw new RangeError(`canvas run ${index} text exceeds u32 length`);
+      }
+      return { run, text };
+    });
+    const byteLength = encodedRuns.reduce((sum, value) => sum + 20 + value.text.byteLength, 16);
+    if (!Number.isSafeInteger(byteLength) || byteLength > PTX_MAX_PACKET_BYTES) {
+      throw new RangeError("canvas frame exceeds the PTX packet limit");
+    }
+
+    const payload = new Uint8Array(byteLength);
+    const view = dataView(payload);
+    view.setBigUint64(0, handle, true);
+    view.setUint16(8, frame.width, true);
+    view.setUint16(10, frame.height, true);
+    view.setUint32(12, encodedRuns.length, true);
+    let offset = 16;
+    for (const { run, text } of encodedRuns) {
+      view.setUint16(offset, run.row, true);
+      view.setUint16(offset + 2, run.column, true);
+      view.setUint16(offset + 4, encodeAttributes(run.style), true);
+      view.setUint32(offset + 8, encodeColor(run.style?.foreground), true);
+      view.setUint32(offset + 12, encodeColor(run.style?.background), true);
+      view.setUint32(offset + 16, text.byteLength, true);
+      payload.set(text, offset + 20);
+      offset += 20 + text.byteLength;
+    }
+    return this.#record(PtxOpcode.SetCanvasFrame, payload);
+  }
+
+  setCursor(options: CursorPacketOptions): this {
+    assertU16(options.row, "cursor row");
+    assertU16(options.column, "cursor column");
+    const payload = new Uint8Array(16);
+    const view = dataView(payload);
+    view.setUint16(0, options.row, true);
+    view.setUint16(2, options.column, true);
+    payload[4] = options.visible === false ? 0 : 1;
+    switch (options.shape ?? "block") {
+      case "block":
+        payload[5] = 0;
+        break;
+      case "underline":
+        payload[5] = 1;
+        break;
+      case "bar":
+        payload[5] = 2;
+        break;
+      default:
+        throw new RangeError(`Unsupported cursor shape: ${String(options.shape)}`);
+    }
+    view.setUint32(8, encodeColor(options.color), true);
+    return this.#record(PtxOpcode.SetCursor, payload);
+  }
+
+  setEffectBus(options: EffectBusPacketOptions): this {
+    if (options.profile !== "ghostty-palette-v1") {
+      throw new RangeError(`Unsupported effect bus profile: ${String(options.profile)}`);
+    }
+    const channels = options.channels ?? ZERO_EFFECT_CHANNELS;
+    if (channels.length !== 3) {
+      throw new RangeError("effect bus must contain exactly three channels");
+    }
+    const payload = new Uint8Array(16);
+    payload[0] = 1;
+    payload[1] = (options.enabled === false ? 0 : 1) | (options.trigger ? 2 : 0);
+    let offset = 4;
+    for (const [channelIndex, channel] of channels.entries()) {
+      if (channel.length !== 3) {
+        throw new RangeError(`effect bus channel ${channelIndex} must contain three bytes`);
+      }
+      for (const [componentIndex, component] of channel.entries()) {
+        assertByte(component, `effect bus channel ${channelIndex} component ${componentIndex}`);
+        payload[offset] = component;
+        offset += 1;
+      }
+    }
+    return this.#record(PtxOpcode.SetEffectBus, payload);
   }
 
   finish(): Uint8Array {
@@ -326,6 +499,111 @@ function decodeOperation(
         handle: view.getBigUint64(payloadOffset, true),
         transcript: view.getBigUint64(payloadOffset + 8, true),
       };
+    case PtxOpcode.CreateCanvas:
+      return { opcode, handle: handle() };
+    case PtxOpcode.SetCanvasFrame: {
+      ensurePayload(payloadLength, 16);
+      const canvasHandle = view.getBigUint64(payloadOffset, true);
+      const width = view.getUint16(payloadOffset + 8, true);
+      const height = view.getUint16(payloadOffset + 10, true);
+      if (width === 0 || height === 0) {
+        throw new PtxDecodeError("canvas dimensions must be non-zero");
+      }
+      const runCount = view.getUint32(payloadOffset + 12, true);
+      const runs: CanvasRun[] = [];
+      let cursor = payloadOffset + 16;
+      const payloadEnd = payloadOffset + payloadLength;
+      for (let index = 0; index < runCount; index += 1) {
+        ensureRange(packet, cursor, 20);
+        if (cursor + 20 > payloadEnd) throw new PtxDecodeError("canvas run header exceeds record bounds");
+        const row = view.getUint16(cursor, true);
+        const column = view.getUint16(cursor + 2, true);
+        const attributes = view.getUint16(cursor + 4, true);
+        if (packet[cursor + 6] !== 0 || packet[cursor + 7] !== 0) {
+          throw new PtxDecodeError("non-zero canvas run padding");
+        }
+        const foreground = decodeColor(view.getUint32(cursor + 8, true));
+        const background = decodeColor(view.getUint32(cursor + 12, true));
+        const textLength = view.getUint32(cursor + 16, true);
+        cursor += 20;
+        if (cursor + textLength > payloadEnd) {
+          throw new PtxDecodeError("canvas run text exceeds record bounds");
+        }
+        const text = decoder.decode(packet.subarray(cursor, cursor + textLength));
+        cursor += textLength;
+        if (row >= height || column >= width) {
+          throw new PtxDecodeError("canvas run starts outside the frame");
+        }
+        if (text.length === 0 || /\r|\n/u.test(text)) {
+          throw new PtxDecodeError("canvas run text is empty or multiline");
+        }
+        runs.push({ row, column, text, style: decodeStyle(attributes, foreground, background) });
+      }
+      if (packet.subarray(cursor, payloadEnd).some((byte) => byte !== 0)) {
+        throw new PtxDecodeError("non-zero canvas frame padding");
+      }
+      return { opcode, handle: canvasHandle, frame: { width, height, runs } };
+    }
+    case PtxOpcode.SetCursor: {
+      ensurePayload(payloadLength, 16);
+      const visibleByte = packet[payloadOffset + 4];
+      if (visibleByte !== 0 && visibleByte !== 1) {
+        throw new PtxDecodeError("invalid cursor visibility flag");
+      }
+      const shapeByte = packet[payloadOffset + 5];
+      const shape = shapeByte === 0 ? "block" : shapeByte === 1 ? "underline" : shapeByte === 2 ? "bar" : undefined;
+      if (shape === undefined) {
+        throw new PtxDecodeError("invalid cursor shape");
+      }
+      if (
+        packet.subarray(payloadOffset + 6, payloadOffset + 8).some((byte) => byte !== 0) ||
+        packet.subarray(payloadOffset + 12, payloadOffset + payloadLength).some((byte) => byte !== 0)
+      ) {
+        throw new PtxDecodeError("non-zero SetCursor padding");
+      }
+      return {
+        opcode,
+        options: {
+          row: view.getUint16(payloadOffset, true),
+          column: view.getUint16(payloadOffset + 2, true),
+          visible: visibleByte === 1,
+          shape,
+          color: decodeColor(view.getUint32(payloadOffset + 8, true)),
+        },
+      };
+    }
+    case PtxOpcode.SetEffectBus: {
+      if (payloadLength !== 16) {
+        throw new PtxDecodeError("SetEffectBus payload must be exactly 16 bytes");
+      }
+      if (packet[payloadOffset] !== 1) {
+        throw new PtxDecodeError("unsupported effect bus profile");
+      }
+      const effectFlags = packet[payloadOffset + 1] ?? 0;
+      if ((effectFlags & ~0x03) !== 0) {
+        throw new PtxDecodeError("unknown required effect bus flag");
+      }
+      if (
+        packet.subarray(payloadOffset + 2, payloadOffset + 4).some((byte) => byte !== 0) ||
+        packet.subarray(payloadOffset + 13, payloadOffset + payloadLength).some((byte) => byte !== 0)
+      ) {
+        throw new PtxDecodeError("non-zero SetEffectBus padding");
+      }
+      const channel = (offset: number): EffectBusChannel => [
+        packet[payloadOffset + offset] ?? 0,
+        packet[payloadOffset + offset + 1] ?? 0,
+        packet[payloadOffset + offset + 2] ?? 0,
+      ];
+      return {
+        opcode,
+        options: {
+          profile: "ghostty-palette-v1",
+          enabled: (effectFlags & 1) !== 0,
+          trigger: (effectFlags & 2) !== 0,
+          channels: [channel(4), channel(7), channel(10)],
+        },
+      };
+    }
     default:
       throw new PtxDecodeError(`unknown required opcode ${opcode}`);
   }
@@ -349,6 +627,77 @@ function assertU16(value: number, name: string): void {
   if (!Number.isInteger(value) || value < 0 || value > 0xffff) {
     throw new RangeError(`${name} must be a u16`);
   }
+}
+
+function assertByte(value: number, name: string): void {
+  if (!Number.isInteger(value) || value < 0 || value > 0xff) {
+    throw new RangeError(`${name} must be a byte`);
+  }
+}
+
+function encodeAttributes(style: TuiStyle | undefined): number {
+  let attributes = 0;
+  if (style?.bold) attributes |= 1 << 0;
+  if (style?.dim) attributes |= 1 << 1;
+  if (style?.italic) attributes |= 1 << 2;
+  if (style?.underline) attributes |= 1 << 3;
+  if (style?.blink) attributes |= 1 << 4;
+  if (style?.reverse) attributes |= 1 << 5;
+  if (style?.hidden) attributes |= 1 << 6;
+  if (style?.strikethrough) attributes |= 1 << 7;
+  return attributes;
+}
+
+function decodeStyle(attributes: number, foreground: TuiColor, background: TuiColor): TuiStyle {
+  if (attributes & ~0xff) throw new PtxDecodeError("unknown required canvas style attribute");
+  return {
+    foreground,
+    background,
+    bold: (attributes & (1 << 0)) !== 0,
+    dim: (attributes & (1 << 1)) !== 0,
+    italic: (attributes & (1 << 2)) !== 0,
+    underline: (attributes & (1 << 3)) !== 0,
+    blink: (attributes & (1 << 4)) !== 0,
+    reverse: (attributes & (1 << 5)) !== 0,
+    hidden: (attributes & (1 << 6)) !== 0,
+    strikethrough: (attributes & (1 << 7)) !== 0,
+  };
+}
+
+function encodeColor(color: TuiColor | undefined): number {
+  if (color === undefined || color.kind === "default") return 0;
+  if (color.kind === "indexed") {
+    if (!Number.isInteger(color.index) || color.index < 0 || color.index > 0xff) {
+      throw new RangeError("indexed color must be between 0 and 255");
+    }
+    return (0x0100_0000 | color.index) >>> 0;
+  }
+  for (const [name, value] of [
+    ["red", color.red],
+    ["green", color.green],
+    ["blue", color.blue],
+  ] as const) {
+    if (!Number.isInteger(value) || value < 0 || value > 0xff) {
+      throw new RangeError(`RGB ${name} component must be between 0 and 255`);
+    }
+  }
+  return (0x0200_0000 | (color.red << 16) | (color.green << 8) | color.blue) >>> 0;
+}
+
+function decodeColor(packed: number): TuiColor {
+  const kind = packed >>> 24;
+  const value = packed & 0x00ff_ffff;
+  if (kind === 0 && value === 0) return { kind: "default" };
+  if (kind === 1 && value <= 0xff) return { kind: "indexed", index: value };
+  if (kind === 2) {
+    return {
+      kind: "rgb",
+      red: (value >>> 16) & 0xff,
+      green: (value >>> 8) & 0xff,
+      blue: value & 0xff,
+    };
+  }
+  throw new PtxDecodeError("invalid packed color");
 }
 
 function ensureRange(packet: Uint8Array, offset: number, length: number): void {

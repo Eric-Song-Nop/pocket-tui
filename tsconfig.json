@@ -5,7 +5,8 @@
     "moduleResolution": "NodeNext",
     "baseUrl": ".",
     "paths": {
-      "@pocket-tui/core": ["packages/core/src/index.ts"]
+      "@pocket-tui/core": ["packages/core/src/index.ts"],
+      "@pocket-tui/pocketjs": ["packages/pocketjs/src/index.ts"]
     },
     "strict": true,
     "declaration": true,

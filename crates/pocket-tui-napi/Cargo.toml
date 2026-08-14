@@ -9,6 +9,7 @@ repository.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
+libc.workspace = true
 napi.workspace = true
 napi-derive.workspace = true
 pocket-tui-core = { path = "../pocket-tui-core" }
@@ -16,4 +17,3 @@ pocket-tui-terminal = { path = "../pocket-tui-terminal" }
 
 [build-dependencies]
 napi-build = "2"
-

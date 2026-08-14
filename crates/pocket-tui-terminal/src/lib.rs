@@ -12,7 +12,7 @@ mod session;
 mod state;
 mod transport;
 
-pub use capability::{ColorCapability, TerminalCapabilities};
+pub use capability::{ColorCapability, EffectBusCapability, TerminalCapabilities};
 pub use encoder::EncodeError;
 pub use guard::TerminalGuard;
 pub use input::{
@@ -20,7 +20,7 @@ pub use input::{
     TerminalInput,
 };
 pub use session::{SessionProgress, TerminalError, TerminalSession};
-pub use state::{CursorState, PhysicalState};
+pub use state::{CursorShape, CursorState, EffectBusState, PhysicalState};
 pub use transport::FdWriter;
 
 pub use pocket_tui_core::VERSION;

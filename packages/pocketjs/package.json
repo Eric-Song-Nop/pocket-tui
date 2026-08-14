@@ -1,0 +1,35 @@
+{
+  "name": "@pocket-tui/pocketjs",
+  "version": "0.1.0",
+  "description": "PocketJS 0.6 HostOps backend for PocketTUI terminals",
+  "type": "module",
+  "imports": {
+    "#pocketjs-runtime": {
+      "types": "./types/runtime.d.ts",
+      "default": "./runtime/pocketjs-runtime.js"
+    }
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "runtime", "types", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepack": "bun run build",
+    "pack:check": "bun pm pack --dry-run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "contract:upstream": "tsc -p tsconfig.upstream-contract.json",
+    "test": "bun test test && bun run contract:upstream"
+  },
+  "dependencies": {
+    "@pocket-tui/core": "workspace:*",
+    "@pocketjs/framework": "0.6.0",
+    "solid-js": "^1.9.9"
+  },
+  "engines": {
+    "bun": ">=1.2"
+  }
+}

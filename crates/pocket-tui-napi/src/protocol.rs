@@ -23,6 +23,10 @@ pub enum Opcode {
     AppendBlockText = 10,
     SealBlock = 11,
     CreateVirtualTranscript = 12,
+    CreateCanvas = 13,
+    SetCanvasFrame = 14,
+    SetCursor = 15,
+    SetEffectBus = 16,
 }
 
 impl TryFrom<u16> for Opcode {
@@ -42,6 +46,10 @@ impl TryFrom<u16> for Opcode {
             10 => Ok(Self::AppendBlockText),
             11 => Ok(Self::SealBlock),
             12 => Ok(Self::CreateVirtualTranscript),
+            13 => Ok(Self::CreateCanvas),
+            14 => Ok(Self::SetCanvasFrame),
+            15 => Ok(Self::SetCursor),
+            16 => Ok(Self::SetEffectBus),
             _ => Err(DecodeError::new(format!("unknown required opcode {value}"))),
         }
     }
@@ -51,6 +59,36 @@ impl TryFrom<u16> for Opcode {
 pub enum Direction {
     Column,
     Row,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ColorSpec {
+    Default,
+    Indexed(u8),
+    Rgb(u8, u8, u8),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CursorShape {
+    #[default]
+    Block,
+    Underline,
+    Bar,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EffectBusProfile {
+    GhosttyPaletteV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanvasRun<'a> {
+    pub row: u16,
+    pub column: u16,
+    pub attributes: u16,
+    pub foreground: ColorSpec,
+    pub background: ColorSpec,
+    pub text: &'a str,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -100,6 +138,28 @@ pub enum Operation<'a> {
     CreateVirtualTranscript {
         handle: u64,
         transcript: u64,
+    },
+    CreateCanvas {
+        handle: u64,
+    },
+    SetCanvasFrame {
+        handle: u64,
+        width: u16,
+        height: u16,
+        runs: Vec<CanvasRun<'a>>,
+    },
+    SetCursor {
+        row: u16,
+        column: u16,
+        visible: bool,
+        shape: CursorShape,
+        color: ColorSpec,
+    },
+    SetEffectBus {
+        profile: EffectBusProfile,
+        enabled: bool,
+        trigger: bool,
+        channels: [[u8; 3]; 3],
     },
 }
 
@@ -270,6 +330,150 @@ fn decode_operation(opcode: Opcode, payload: &[u8]) -> Result<Operation<'_>, Dec
                 transcript: read_u64(payload, 8)?,
             })
         }
+        Opcode::CreateCanvas => {
+            require_payload(payload, 8)?;
+            Ok(Operation::CreateCanvas {
+                handle: read_u64(payload, 0)?,
+            })
+        }
+        Opcode::SetCanvasFrame => decode_canvas_frame(payload),
+        Opcode::SetCursor => {
+            require_payload(payload, 16)?;
+            let visible = match payload[4] {
+                0 => false,
+                1 => true,
+                value => {
+                    return Err(DecodeError::new(format!(
+                        "invalid cursor visibility flag {value}"
+                    )));
+                }
+            };
+            let shape = match payload[5] {
+                0 => CursorShape::Block,
+                1 => CursorShape::Underline,
+                2 => CursorShape::Bar,
+                value => {
+                    return Err(DecodeError::new(format!("invalid cursor shape {value}")));
+                }
+            };
+            if payload[6..8].iter().any(|byte| *byte != 0)
+                || payload[12..].iter().any(|byte| *byte != 0)
+            {
+                return Err(DecodeError::new("non-zero SetCursor padding"));
+            }
+            Ok(Operation::SetCursor {
+                row: read_u16(payload, 0)?,
+                column: read_u16(payload, 2)?,
+                visible,
+                shape,
+                color: decode_color(read_u32(payload, 8)?)?,
+            })
+        }
+        Opcode::SetEffectBus => {
+            if payload.len() != 16 {
+                return Err(DecodeError::new(
+                    "SetEffectBus payload must be exactly 16 bytes",
+                ));
+            }
+            let profile = match payload[0] {
+                1 => EffectBusProfile::GhosttyPaletteV1,
+                _ => return Err(DecodeError::new("unsupported effect bus profile")),
+            };
+            let flags = payload[1];
+            if flags & !0x03 != 0 {
+                return Err(DecodeError::new("unknown required effect bus flag"));
+            }
+            if payload[2..4].iter().any(|byte| *byte != 0)
+                || payload[13..16].iter().any(|byte| *byte != 0)
+            {
+                return Err(DecodeError::new("non-zero SetEffectBus padding"));
+            }
+            Ok(Operation::SetEffectBus {
+                profile,
+                enabled: flags & 1 != 0,
+                trigger: flags & 2 != 0,
+                channels: [
+                    [payload[4], payload[5], payload[6]],
+                    [payload[7], payload[8], payload[9]],
+                    [payload[10], payload[11], payload[12]],
+                ],
+            })
+        }
+    }
+}
+
+fn decode_canvas_frame(payload: &[u8]) -> Result<Operation<'_>, DecodeError> {
+    require_payload(payload, 16)?;
+    let handle = read_u64(payload, 0)?;
+    let width = read_u16(payload, 8)?;
+    let height = read_u16(payload, 10)?;
+    if width == 0 || height == 0 {
+        return Err(DecodeError::new("canvas dimensions must be non-zero"));
+    }
+    let run_count = read_u32(payload, 12)? as usize;
+    if run_count > payload.len().saturating_sub(16) / 20 {
+        return Err(DecodeError::new("impossible canvas run count"));
+    }
+    let mut offset = 16usize;
+    let mut runs = Vec::with_capacity(run_count);
+    for _ in 0..run_count {
+        let header_end = offset
+            .checked_add(20)
+            .filter(|end| *end <= payload.len())
+            .ok_or_else(|| DecodeError::new("canvas run header exceeds record bounds"))?;
+        let text_len = read_u32(payload, offset + 16)? as usize;
+        let text_end = header_end
+            .checked_add(text_len)
+            .filter(|end| *end <= payload.len())
+            .ok_or_else(|| DecodeError::new("canvas run text exceeds record bounds"))?;
+        let text = std::str::from_utf8(&payload[header_end..text_end])
+            .map_err(|_| DecodeError::new("canvas run text is not valid UTF-8"))?;
+        runs.push(CanvasRun {
+            row: read_u16(payload, offset)?,
+            column: read_u16(payload, offset + 2)?,
+            attributes: read_u16(payload, offset + 4)?,
+            foreground: decode_color(read_u32(payload, offset + 8)?)?,
+            background: decode_color(read_u32(payload, offset + 12)?)?,
+            text,
+        });
+        let run = runs.last().expect("the run was just appended");
+        if run.row >= height || run.column >= width {
+            return Err(DecodeError::new("canvas run starts outside the frame"));
+        }
+        if run.text.is_empty() || run.text.contains(['\r', '\n']) {
+            return Err(DecodeError::new("canvas run text is empty or multiline"));
+        }
+        if payload[offset + 6..offset + 8]
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Err(DecodeError::new("non-zero canvas run padding"));
+        }
+        offset = text_end;
+    }
+    if payload[offset..].iter().any(|byte| *byte != 0) {
+        return Err(DecodeError::new("non-zero canvas frame padding"));
+    }
+    Ok(Operation::SetCanvasFrame {
+        handle,
+        width,
+        height,
+        runs,
+    })
+}
+
+fn decode_color(packed: u32) -> Result<ColorSpec, DecodeError> {
+    let kind = packed >> 24;
+    let value = packed & 0x00ff_ffff;
+    match (kind, value) {
+        (0, 0) => Ok(ColorSpec::Default),
+        (1, 0..=0xff) => Ok(ColorSpec::Indexed(value as u8)),
+        (2, _) => Ok(ColorSpec::Rgb(
+            ((value >> 16) & 0xff) as u8,
+            ((value >> 8) & 0xff) as u8,
+            (value & 0xff) as u8,
+        )),
+        _ => Err(DecodeError::new("invalid packed color")),
     }
 }
 
@@ -321,4 +525,86 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, DecodeError> {
     Ok(u64::from_le_bytes([
         value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effect_bus_decodes_the_fixed_profile_payload() {
+        let payload = [1, 3, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 255, 0, 0, 0];
+
+        assert_eq!(
+            decode_operation(Opcode::SetEffectBus, &payload).unwrap(),
+            Operation::SetEffectBus {
+                profile: EffectBusProfile::GhosttyPaletteV1,
+                enabled: true,
+                trigger: true,
+                channels: [[1, 2, 3], [4, 5, 6], [7, 8, 255]],
+            }
+        );
+    }
+
+    #[test]
+    fn effect_bus_rejects_unknown_profiles_flags_and_padding() {
+        let mut payload = [0_u8; 16];
+        assert_eq!(
+            decode_operation(Opcode::SetEffectBus, &payload)
+                .unwrap_err()
+                .to_string(),
+            "unsupported effect bus profile"
+        );
+
+        payload[0] = 1;
+        payload[1] = 4;
+        assert_eq!(
+            decode_operation(Opcode::SetEffectBus, &payload)
+                .unwrap_err()
+                .to_string(),
+            "unknown required effect bus flag"
+        );
+
+        payload[1] = 0;
+        payload[15] = 1;
+        assert_eq!(
+            decode_operation(Opcode::SetEffectBus, &payload)
+                .unwrap_err()
+                .to_string(),
+            "non-zero SetEffectBus padding"
+        );
+    }
+
+    #[test]
+    fn cursor_shape_uses_one_formerly_reserved_byte() {
+        let mut payload = [0_u8; 16];
+        payload[4] = 1;
+        payload[5] = 1;
+        assert_eq!(
+            decode_operation(Opcode::SetCursor, &payload).unwrap(),
+            Operation::SetCursor {
+                row: 0,
+                column: 0,
+                visible: true,
+                shape: CursorShape::Underline,
+                color: ColorSpec::Default,
+            }
+        );
+
+        payload[5] = 3;
+        assert_eq!(
+            decode_operation(Opcode::SetCursor, &payload)
+                .unwrap_err()
+                .to_string(),
+            "invalid cursor shape 3"
+        );
+        payload[5] = 0;
+        payload[6] = 1;
+        assert_eq!(
+            decode_operation(Opcode::SetCursor, &payload)
+                .unwrap_err()
+                .to_string(),
+            "non-zero SetCursor padding"
+        );
+    }
 }

@@ -1,7 +1,9 @@
 # PocketTUI 完整设计
 
-状态：实现基线（Draft 1）  
-日期：2026-08-09  
+状态：目标设计与当前实现边界（Draft 1）
+
+日期：2026-08-14
+
 目标：构建一个以长期低内存、稳定低延迟和终端原生优化为核心，能够替代 OpenTUI/Pi 类渲染内核的 TUI 框架。
 
 ## 1. 结论
@@ -26,6 +28,29 @@ PocketTUI 不采用“JS 每帧构造 UI 树 → native 绘制完整 framebuffer
 ```
 
 渲染、runtime、GC、memory 和 I/O 背压是同一个设计问题，不能分别补丁式优化。
+
+### 1.1 当前实现快照
+
+本文的大部分章节描述目标架构，不代表仓库已经实现全部 v1 能力。当前可运行的 vertical slice 有两条入口：
+
+1. `@pocket-tui/core` 提供 imperative `Box`、`Text`、`Canvas`、`Transcript` API，经 PTX1 进入 Rust `SceneDB`/`DocumentDB`、持久 row damage 与 terminal encoder。
+2. `@pocket-tui/pocketjs` 是 PocketJS 0.6 的 reference `HostOps` backend。它运行真实的 PocketJS/Solid signals、button 与 frame lifecycle，并在 JavaScript 中维护有 generation 的 retained shadow tree。
+
+当前 PocketJS 路径是：
+
+```text
+Solid signals / PocketJS lifecycle
+              ↓ HostOps mutation
+JS retained shadow tree → cell layout → bounded viewport raster
+              ↓ compact CanvasFrame
+PocketTUI Canvas → PTX1 → Rust row damage → ANSI terminal transition
+```
+
+因此旗舰 demo **Signal Below** 不是游戏代码直接绘制 Canvas。游戏只更新 retained PocketJS view/text nodes；`@pocket-tui/pocketjs` 的内部 surface 才创建 Canvas 并提交 frame。这个 reference backend 在 clean frame 跳过 layout/raster，但 dirty frame 仍会在 JS 对 active tree 做 cell layout、物化有上限的 viewport，并提交完整 semantic Canvas frame；Rust 下游再把实际 terminal 输出限制到 dirty rows。它尚未实现本文规划的 native typed-dirty layout、sparse Canvas patch、零 fixed tick scheduler 或完整 widget/compiler 系统。
+
+PocketJS session 当前以 Pocket 虚拟时钟的精确因数频率固定轮询（1/2/3/4/5/6/10/12/15/20/30/60 FPS，默认 30），pump 与 `__simHz` 使用同一数值；terminal key 被建模为 press frame + release frame；pending pulse 上限为 8，direction repeat 使用 latest-direction-wins coalescing。PocketJS 0.6 renderer 是进程全局状态，因此 adapter 显式限制为每进程一个 active session。颜色默认明确降级为 ANSI16，truecolor 是显式选择；没有主动 capability probe。texture/image/sprite/font atlas/timed animation 等 pixel-oriented 能力都有可观测的占位或 endpoint fallback，而不是宣称完整支持。
+
+当前 backend 的完整能力表、数据所有权与降级语义见 [`docs/pocketjs-backend.md`](pocketjs-backend.md)。后文涉及 compiler、native interaction islands、main/direct surface、完整 probing、virtual document index、image protocol 与 benchmark gate 的部分仍是目标设计。
 
 ## 2. 产品边界
 
@@ -1058,34 +1083,25 @@ release 构建只保留计数器；timeline trace 是显式开关。trace 事件
 
 ## 20. Repository 与模块边界
 
-建议新建独立 sibling project `pocket-tui`，复用 PocketJS 的 packaging、generational handle、batch bridge 和 allocator telemetry 经验，但不复用 pixel DrawList。
+本仓库已经建立 `pocket-tui` vertical slice。当前实际模块为：
 
 ```text
 pocket-tui/
   packages/
-    core/                 public JS/TS API
-    compiler/             TSX transform and static templates
-    jsx-runtime/          JSX compiler/runtime contracts
-    compat-opentui/       migration adapter
-    testing/              headless runtime, trace tools, VT oracle
-    terminal-profiles/    versioned capability/quirk data
+    core/                 current public JS/TS API and PTX encoder
+    pocketjs/             current PocketJS 0.6 HostOps reference backend
   crates/
-    pocket-tui-abi/       binary protocol and validation
-    pocket-tui-runtime/   owner loop and scheduler
-    pocket-tui-scene/     SceneDB, dirty phases, layout, hit
-    pocket-tui-document/  blocks, height index, provider/spill
-    pocket-tui-paint/     cells, artifacts, damage
-    pocket-tui-terminal/  parser, probing, transition planner
-    pocket-tui-io/        nonblocking transactional writer
-    pocket-tui-napi/      Node/Bun binding
-    pocket-tui-oracle/    VT model and trace runner
-  fixtures/
-    unicode/
-    terminals/
-    traces/
+    pocket-tui-core/      current SceneDB, DocumentDB, layout and damage
+    pocket-tui-terminal/  current input, transition encoder and transport
+    pocket-tui-napi/      current PTX decoder and Node/Bun binding
+  examples/
+    basic/                imperative transcript vertical slice
+    roguelike/            PocketJS retained-backend flagship demo
 ```
 
-crate 之间传 typed data，不共享大而可变的 `Runtime` struct。`terminal` 不读取 SceneDB；它只看 desired artifacts、semantic records 和 confirmed state。`document` 不输出 cells；它只提供 materialized block/layout inputs。
+`compiler`、`jsx-runtime`、compat、testing/oracle 与 terminal profile packages，以及更细分的 runtime/document/paint/io crates，仍是目标模块边界，不应从本文的规划章节推断为现有 package。
+
+目标 crate 之间传 typed data，不共享大而可变的 `Runtime` struct。`terminal` 不读取 SceneDB；它只看 desired artifacts、semantic records 和 confirmed state。未来独立的 `document` crate 不输出 cells；它只提供 materialized block/layout inputs。
 
 ### 20.1 Compatibility boundary
 
@@ -1099,7 +1115,7 @@ crate 之间传 typed data，不共享大而可变的 `Runtime` struct。`termin
 />
 ```
 
-`AnsiLeaf` 仅在显式 invalidation 时重新解析 ANSI，并作为一个 opaque paint boundary。PocketTUI 无法虚拟化其内部历史、优化内部 damage、提供语义 selection 或 native hit testing；telemetry 必须把其 CPU/allocation/damage 单独标出。React/Solid/旧 reconciler 也可生成 imperative transaction，但都不是 reference performance path。
+`AnsiLeaf` 仅在显式 invalidation 时重新解析 ANSI，并作为一个 opaque paint boundary。PocketTUI 无法虚拟化其内部历史、优化内部 damage、提供语义 selection 或 native hit testing；telemetry 必须把其 CPU/allocation/damage 单独标出。当前 `@pocket-tui/pocketjs`/Solid adapter 是 HostOps compatibility 与旗舰集成的 reference backend，但它先在 JS 做 shadow-tree layout/raster 再提交 Canvas，因此不是本文所指的最终 native reference performance path。其他 React/Solid/旧 reconciler adapter 也必须明确标注同类成本。
 
 ## 21. 实现顺序
 
@@ -1206,4 +1222,3 @@ PocketTUI 的差异化不是单个更快的 diff 函数，而是五个互相约�
 5. **oracle 驱动**：每个优化都能回退到明确 full path，并通过同一 VT 状态验证。
 
 只有当这五点同时被原型和门禁证明后，才扩展完整 widget/CSS 生态。否则即使 microbenchmark 很漂亮，也还不是性能最好的长期 TUI runtime。
-

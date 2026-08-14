@@ -230,6 +230,11 @@ impl Runtime {
             NodeKind::Transcript(transcript) => {
                 apply_layout(transcript.layout, available, available)
             }
+            NodeKind::Canvas(canvas) => apply_layout(
+                canvas.layout,
+                Size::new(canvas.width, canvas.height),
+                available,
+            ),
             NodeKind::Box(box_node) => {
                 let inner = Size::new(
                     available.columns.saturating_sub(
@@ -442,6 +447,44 @@ impl Runtime {
                     )?;
                 }
             }
+            NodeKind::Canvas(canvas) => {
+                for run in &canvas.runs {
+                    if run.row >= canvas.height || run.row >= node.rect().height {
+                        continue;
+                    }
+                    if run.column >= canvas.width || run.column >= node.rect().width {
+                        continue;
+                    }
+                    let style = self.intern_style(Style {
+                        foreground: run.foreground,
+                        background: run.background,
+                        attributes: run.attributes,
+                    })?;
+                    let text = crate::TextNode {
+                        text: run.text.clone(),
+                        style,
+                        layout: LayoutSpec::default(),
+                        wrap: false,
+                    };
+                    let relative_row = run.row;
+                    let relative_column = run.column;
+                    paint_text(
+                        Rect::new(
+                            node.rect().column.0.saturating_add(relative_column),
+                            node.rect().row.0.saturating_add(relative_row),
+                            node.rect()
+                                .width
+                                .saturating_sub(relative_column)
+                                .min(canvas.width.saturating_sub(relative_column)),
+                            1,
+                        ),
+                        &text,
+                        rows,
+                        self.size,
+                        &mut self.graphemes,
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -532,7 +575,7 @@ fn paint_text(
             .width();
         if relative_column.saturating_add(width as u16) > rect.width {
             if !node.wrap {
-                continue;
+                break;
             }
             relative_row = relative_row.saturating_add(1);
             relative_column = 0;
@@ -570,4 +613,148 @@ pub enum RuntimeError {
     Document(#[from] DocumentError),
     #[error("the MVP transcript primitive supports follow-tail mode only")]
     UnsupportedTranscriptMode,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CanvasNode, CanvasRun, Color, TextAttributes};
+
+    #[test]
+    fn canvas_runs_paint_styles_and_damage_only_changed_rows() {
+        let mut runtime = Runtime::new(Size::new(5, 2));
+        let canvas = runtime
+            .scene_mut()
+            .create_canvas(
+                None,
+                CanvasNode {
+                    width: 5,
+                    height: 2,
+                    runs: vec![CanvasRun {
+                        row: 0,
+                        column: 1,
+                        text: "@!".to_owned(),
+                        foreground: Color::Indexed(14),
+                        background: Color::Default,
+                        attributes: TextAttributes::BOLD,
+                    }],
+                    layout: LayoutSpec::FILL,
+                },
+            )
+            .unwrap();
+
+        let first = runtime.render_frame().unwrap();
+        let row = first.screen.row(crate::Row(0)).unwrap();
+        let player = row.cells()[1];
+        assert_eq!(
+            first
+                .resources
+                .grapheme(player.grapheme())
+                .unwrap()
+                .as_str(),
+            "@"
+        );
+        let style = first.resources.style(player.style()).unwrap();
+        assert_eq!(style.foreground, Color::Indexed(14));
+        assert!(style.attributes.contains(TextAttributes::BOLD));
+
+        runtime
+            .scene_mut()
+            .set_canvas_frame(
+                canvas,
+                5,
+                2,
+                vec![CanvasRun {
+                    row: 1,
+                    column: 3,
+                    text: "*".to_owned(),
+                    foreground: Color::Indexed(13),
+                    background: Color::Default,
+                    attributes: TextAttributes::empty(),
+                }],
+            )
+            .unwrap();
+        let second = runtime.render_frame().unwrap();
+
+        assert_eq!(second.dirty_rows.len(), 2);
+        assert_eq!(second.dirty_rows[0].row, crate::Row(0));
+        assert_eq!(second.dirty_rows[1].row, crate::Row(1));
+        let row = second.screen.row(crate::Row(1)).unwrap();
+        let relic = row.cells()[3];
+        assert_eq!(
+            second
+                .resources
+                .grapheme(relic.grapheme())
+                .unwrap()
+                .as_str(),
+            "*"
+        );
+        assert_eq!(
+            second.resources.style(relic.style()).unwrap().foreground,
+            Color::Indexed(13)
+        );
+    }
+
+    #[test]
+    fn canvas_clips_to_its_allocated_layout_rect() {
+        let mut runtime = Runtime::new(Size::new(4, 2));
+        let root = runtime
+            .scene_mut()
+            .create_box(None, BoxNode::default())
+            .unwrap();
+        runtime
+            .scene_mut()
+            .create_canvas(
+                Some(root),
+                CanvasNode {
+                    width: 3,
+                    height: 4,
+                    runs: vec![
+                        CanvasRun {
+                            row: 0,
+                            column: 0,
+                            text: "A界B".to_owned(),
+                            foreground: Color::Default,
+                            background: Color::Default,
+                            attributes: TextAttributes::empty(),
+                        },
+                        CanvasRun {
+                            row: 3,
+                            column: 0,
+                            text: "leak".to_owned(),
+                            foreground: Color::Default,
+                            background: Color::Default,
+                            attributes: TextAttributes::empty(),
+                        },
+                    ],
+                    layout: LayoutSpec {
+                        width: Length::Cells(3),
+                        height: Length::Cells(1),
+                    },
+                },
+            )
+            .unwrap();
+        runtime
+            .scene_mut()
+            .create_text(Some(root), crate::TextNode::new("SAFE"))
+            .unwrap();
+
+        let frame = runtime.render_frame().unwrap();
+        let row0 = frame.screen.row(crate::Row(0)).unwrap();
+        let row0_text: String = row0
+            .cells()
+            .iter()
+            .filter(|cell| cell.is_lead())
+            .map(|cell| frame.resources.grapheme(cell.grapheme()).unwrap().as_str())
+            .collect();
+        assert_eq!(row0_text, "A界 ");
+        let row1 = frame.screen.row(crate::Row(1)).unwrap();
+        let row1_text: String = row1
+            .cells()
+            .iter()
+            .filter(|cell| cell.is_lead())
+            .map(|cell| frame.resources.grapheme(cell.grapheme()).unwrap().as_str())
+            .collect();
+        assert_eq!(row1_text, "SAFE");
+    }
 }

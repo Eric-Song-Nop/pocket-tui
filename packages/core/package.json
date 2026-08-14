@@ -11,6 +11,8 @@
   "files": ["dist", "native", "README.md"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepack": "bun run --cwd ../.. build:native && bun run build",
+    "pack:check": "bun pm pack --dry-run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "engines": {

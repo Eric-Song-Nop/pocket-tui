@@ -35,6 +35,8 @@ pub enum KeyCode {
     ArrowDown,
     ArrowLeft,
     ArrowRight,
+    /// A complete escape sequence not yet modeled by the typed MVP parser.
+    UnknownEscape,
 }
 
 /// One decoded key occurrence.
@@ -239,6 +241,35 @@ impl InputParser {
             return false;
         }
 
+        // Consume complete CSI/SS3 sequences that this conservative parser
+        // does not model yet. Treating their ESC prefix as a standalone Escape
+        // would make modified arrows and function keys trigger app-level quit.
+        if self.buffer.starts_with(b"\x1b[") || self.buffer.starts_with(b"\x1bO") {
+            if let Some(end) = self.buffer[2..]
+                .iter()
+                .position(|byte| (0x40..=0x7e).contains(byte))
+            {
+                self.buffer.drain(..end + 3);
+                events.push(key(KeyCode::UnknownEscape, KeyModifiers::NONE));
+                return true;
+            }
+            return false;
+        }
+
+        // ESC followed immediately by a complete printable scalar is an Alt
+        // chord in the conventional terminal protocol, not a standalone Escape
+        // followed by text. Consume it as one currently-unmodeled sequence so
+        // applications do not interpret Alt+W as quit and then move.
+        if self.buffer.len() > 1 {
+            let scalar_length = complete_utf8_scalar_len(&self.buffer[1..]);
+            if scalar_length == 0 {
+                return false;
+            }
+            self.buffer.drain(..scalar_length + 1);
+            events.push(key(KeyCode::UnknownEscape, KeyModifiers::NONE));
+            return true;
+        }
+
         self.buffer.remove(0);
         events.push(key(KeyCode::Escape, KeyModifiers::NONE));
         true
@@ -415,6 +446,27 @@ fn complete_utf8_prefix_len(bytes: &[u8]) -> usize {
     index
 }
 
+fn complete_utf8_scalar_len(bytes: &[u8]) -> usize {
+    let Some(&first) = bytes.first() else {
+        return 0;
+    };
+    let width = match first {
+        0x20..=0x7e => 1,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 1,
+    };
+    if bytes.len() < width {
+        return 0;
+    }
+    if width > 1 && std::str::from_utf8(&bytes[..width]).is_err() {
+        1
+    } else {
+        width
+    }
+}
+
 fn emit_paste_chunks(events: &mut Vec<InputEvent>, bytes: &[u8], limit: usize) {
     let mut remaining = bytes;
     while !remaining.is_empty() {
@@ -467,6 +519,31 @@ mod tests {
                 key(KeyCode::Backspace, KeyModifiers::NONE),
                 key(KeyCode::Char('c'), KeyModifiers::CTRL),
             ]
+        );
+    }
+
+    #[test]
+    fn modified_arrow_is_not_misreported_as_standalone_escape() {
+        let mut parser = InputParser::default();
+        assert_eq!(
+            parser.feed(b"\x1b[1;2A").unwrap(),
+            vec![key(KeyCode::UnknownEscape, KeyModifiers::NONE)]
+        );
+    }
+
+    #[test]
+    fn alt_printable_is_one_unknown_sequence_not_escape_plus_text() {
+        let mut parser = InputParser::default();
+        assert_eq!(
+            parser.feed(b"\x1bw").unwrap(),
+            vec![key(KeyCode::UnknownEscape, KeyModifiers::NONE)]
+        );
+
+        let mut split = InputParser::default();
+        assert!(split.feed(b"\x1b\xc3").unwrap().is_empty());
+        assert_eq!(
+            split.feed(b"\xa9").unwrap(),
+            vec![key(KeyCode::UnknownEscape, KeyModifiers::NONE)]
         );
     }
 

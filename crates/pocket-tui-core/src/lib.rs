@@ -26,7 +26,10 @@ pub use resources::{
     TextAttributes,
 };
 pub use runtime::{FrameArtifact, FrameGeneration, Runtime, RuntimeError, RuntimeStats};
-pub use scene::{BoxNode, Node, NodeId, NodeKind, SceneDb, SceneError, TextNode, TranscriptNode};
+pub use scene::{
+    BoxNode, CanvasNode, CanvasRun, Node, NodeId, NodeKind, SceneDb, SceneError, TextNode,
+    TranscriptNode,
+};
 pub use screen::{
     DirtySpan, RowDamage, RowGeneration, RowSnapshot, Screen, ScreenError, ScreenRow,
     ScreenSnapshot,

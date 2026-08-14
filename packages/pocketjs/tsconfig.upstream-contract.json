@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "noUncheckedIndexedAccess": false,
+    "paths": {}
+  },
+  "include": ["src/**/*.ts", "contract/**/*.mts"]
+}

@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use napi::bindgen_prelude::Uint8Array;
 use napi::{Error, Result, Status};
 use napi_derive::napi;
+use pocket_tui_core::Size;
 use pocket_tui_terminal::{InputEvent, KeyCode, KeyModifiers};
 
 use runtime_adapter::{MemoryStatsSnapshot, RuntimeAdapter};
@@ -39,6 +40,13 @@ pub struct NativeInputEvent {
     pub rows: Option<u32>,
 }
 
+/// Current terminal viewport dimensions in character cells.
+#[napi(object)]
+pub struct NativeViewportSize {
+    pub columns: u32,
+    pub rows: u32,
+}
+
 #[napi]
 pub fn native_version() -> &'static str {
     pocket_tui_core::VERSION
@@ -52,6 +60,7 @@ pub struct NativeTui {
 
 #[napi]
 impl NativeTui {
+    #[allow(clippy::new_without_default)]
     #[napi(constructor)]
     pub fn new() -> Self {
         Self {
@@ -83,6 +92,13 @@ impl NativeTui {
     pub fn poll_input(&self) -> Result<Vec<NativeInputEvent>> {
         self.with_runtime(RuntimeAdapter::poll_input)
             .map(|events| events.into_iter().map(NativeInputEvent::from).collect())
+    }
+
+    /// Read the latest viewport dimensions directly from the attached tty.
+    #[napi]
+    pub fn viewport_size(&self) -> Result<NativeViewportSize> {
+        self.with_runtime(RuntimeAdapter::viewport_size)
+            .map(Into::into)
     }
 
     #[napi]
@@ -127,6 +143,15 @@ impl From<MemoryStatsSnapshot> for NativeMemoryStats {
             estimated_document_rows: stats.estimated_document_rows as f64,
             estimated_native_bytes: stats.estimated_native_bytes as f64,
             terminal_pending_bytes: stats.terminal_pending_bytes as f64,
+        }
+    }
+}
+
+impl From<Size> for NativeViewportSize {
+    fn from(size: Size) -> Self {
+        Self {
+            columns: size.columns.into(),
+            rows: size.rows.into(),
         }
     }
 }
@@ -195,5 +220,6 @@ fn key_name(code: KeyCode) -> String {
         KeyCode::ArrowDown => "arrow-down".to_owned(),
         KeyCode::ArrowLeft => "arrow-left".to_owned(),
         KeyCode::ArrowRight => "arrow-right".to_owned(),
+        KeyCode::UnknownEscape => "unknown-escape".to_owned(),
     }
 }

@@ -9,9 +9,10 @@
   "scripts": {
     "check": "cargo check --workspace && tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "build:ts": "tsc -p packages/core/tsconfig.json",
+    "build:ts": "tsc -p packages/core/tsconfig.json && tsc -p packages/pocketjs/tsconfig.json",
     "build:native": "cargo build -p pocket-tui-napi --release && node scripts/link-native.mjs",
-    "build": "cargo build -p pocket-tui-napi --release && node scripts/link-native.mjs && tsc -p packages/core/tsconfig.json"
+    "build": "cargo build -p pocket-tui-napi --release && node scripts/link-native.mjs && bun run build:ts",
+    "test": "cargo test --workspace && bun test packages/core/src/protocol.test.ts packages/pocketjs/test examples/roguelike/src/game.test.ts examples/roguelike/src/presentation.test.ts examples/roguelike/src/backend-smoke.test.ts && bun run --cwd packages/pocketjs contract:upstream"
   },
   "devDependencies": {
     "typescript": "^5.9.0"
