@@ -17,11 +17,25 @@ interface RasterCell {
   continuationOf?: number;
 }
 
+interface RasterGrid {
+  readonly rows: Map<number, Array<RasterCell | undefined>>;
+  /** Undefined means every viewport row is being rasterized. */
+  readonly selectedRows?: readonly number[];
+  readonly selectedRowSet?: ReadonlySet<number>;
+}
+
 export type PocketTuiColorMode = "ansi16" | "truecolor";
 
 export interface RasterResult {
   readonly frame: CanvasFrame;
   readonly paintOrder: readonly number[];
+}
+
+export interface RasterOptions {
+  /** Last successfully presented frame whose clean rows can be retained. */
+  readonly previousFrame?: CanvasFrame;
+  /** Complete viewport rows to repaint. Requires a dimension-compatible previous frame. */
+  readonly dirtyRows?: ReadonlySet<number>;
 }
 
 export function rasterize(
@@ -30,8 +44,23 @@ export function rasterize(
   width: number,
   height: number,
   colorMode: PocketTuiColorMode = "ansi16",
+  options: RasterOptions = {},
 ): RasterResult {
-  const cells = new Array<RasterCell | undefined>(width * height);
+  const incremental = options.dirtyRows !== undefined;
+  if (
+    incremental &&
+    (options.previousFrame === undefined ||
+      options.previousFrame.width !== width ||
+      options.previousFrame.height !== height)
+  ) {
+    throw new RangeError("incremental raster requires a previous frame with matching dimensions");
+  }
+  const selectedRows = incremental ? normalizeRows(options.dirtyRows!, height) : undefined;
+  const cells: RasterGrid = {
+    rows: new Map(),
+    selectedRows,
+    selectedRowSet: selectedRows === undefined ? undefined : new Set(selectedRows),
+  };
   const paintOrder: number[] = [];
   const viewport: Rect = { x: 0, y: 0, width, height };
 
@@ -75,11 +104,14 @@ export function rasterize(
   };
 
   paint(root, viewport, 1);
-  return { frame: compactFrame(cells, width, height), paintOrder };
+  return {
+    frame: compactFrame(cells, width, height, incremental ? options.previousFrame : undefined),
+    paintOrder,
+  };
 }
 
 function fillBackground(
-  cells: Array<RasterCell | undefined>,
+  cells: RasterGrid,
   width: number,
   height: number,
   rect: Rect,
@@ -87,7 +119,7 @@ function fillBackground(
   opacity: number,
   colorMode: PocketTuiColorMode,
 ): void {
-  for (let y = rect.y; y < rect.y + rect.height; y += 1) {
+  forEachSelectedRow(cells, rect.y, rect.y + rect.height, (y) => {
     for (let x = rect.x; x < rect.x + rect.width; x += 1) {
       const existing = backgroundAt(cells, width, x, y);
       const background = composite(color, opacity, existing);
@@ -95,11 +127,11 @@ function fillBackground(
         background: tuiColor(background, colorMode),
       });
     }
-  }
+  });
 }
 
 function paintBorder(
-  cells: Array<RasterCell | undefined>,
+  cells: RasterGrid,
   width: number,
   height: number,
   rect: Rect,
@@ -112,7 +144,7 @@ function paintBorder(
   const right = rect.x + rect.width - 1;
   const bottom = rect.y + rect.height - 1;
   const draw = (x: number, y: number, glyph: string): void => {
-    if (!contains(clip, x, y)) return;
+    if (!contains(clip, x, y) || !selectedRow(cells, y)) return;
     const background = backgroundAt(cells, width, x, y);
     const foreground = composite(color, opacity, background);
     writeCell(cells, width, height, x, y, glyph, 1, {
@@ -124,10 +156,10 @@ function paintBorder(
     draw(x, rect.y, "─");
     if (bottom !== rect.y) draw(x, bottom, "─");
   }
-  for (let y = rect.y + 1; y < bottom; y += 1) {
+  forEachSelectedRow(cells, rect.y + 1, bottom, (y) => {
     draw(rect.x, y, "│");
     if (right !== rect.x) draw(right, y, "│");
-  }
+  });
   draw(rect.x, rect.y, rect.width === 1 ? "│" : rect.height === 1 ? "─" : "┌");
   if (right !== rect.x) draw(right, rect.y, rect.height === 1 ? "─" : "┐");
   if (bottom !== rect.y) draw(rect.x, bottom, rect.width === 1 ? "│" : "└");
@@ -135,7 +167,7 @@ function paintBorder(
 }
 
 function paintText(
-  cells: Array<RasterCell | undefined>,
+  cells: RasterGrid,
   width: number,
   height: number,
   rect: Rect,
@@ -145,13 +177,20 @@ function paintText(
   opacity: number,
   colorMode: PocketTuiColorMode,
 ): void {
-  if (rect.width <= 0 || rect.height <= 0) return;
+  if (
+    rect.width <= 0 ||
+    rect.height <= 0 ||
+    !hasSelectedRow(cells, rect.y, rect.y + rect.height)
+  ) {
+    return;
+  }
   const lines = wrapText(text, rect.width);
   const lineStep = Math.max(1, Math.round(style.lineHeight ?? 1));
   const tracking = Math.max(0, Math.round(style.tracking));
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
     const y = rect.y + lineIndex * lineStep;
     if (y >= rect.y + rect.height) break;
+    if (!selectedRow(cells, y)) continue;
     const line = lines[lineIndex] ?? [];
     const lineWidth = line.reduce((sum, item, index) => sum + item.width + (index === line.length - 1 ? 0 : tracking), 0);
     let x = rect.x;
@@ -174,7 +213,7 @@ function paintText(
 }
 
 function writeCell(
-  cells: Array<RasterCell | undefined>,
+  cells: RasterGrid,
   width: number,
   height: number,
   x: number,
@@ -183,54 +222,154 @@ function writeCell(
   glyphWidth: 1 | 2,
   style: TuiStyle,
 ): void {
-  if (x < 0 || y < 0 || x >= width || y >= height || (glyphWidth === 2 && x + 1 >= width)) return;
-  clearOwnedCell(cells, width, x, y);
-  if (glyphWidth === 2) clearOwnedCell(cells, width, x + 1, y);
-  cells[y * width + x] = { glyph, width: glyphWidth, style };
-  if (glyphWidth === 2) cells[y * width + x + 1] = { glyph: "", width: 1, style, continuationOf: x };
-}
-
-function clearOwnedCell(cells: Array<RasterCell | undefined>, width: number, x: number, y: number): void {
-  const index = y * width + x;
-  const cell = cells[index];
-  if (cell === undefined) return;
-  if (cell.continuationOf !== undefined) {
-    const leadIndex = y * width + cell.continuationOf;
-    cells[leadIndex] = undefined;
-    cells[index] = undefined;
+  if (
+    x < 0 ||
+    y < 0 ||
+    x >= width ||
+    y >= height ||
+    (glyphWidth === 2 && x + 1 >= width) ||
+    !selectedRow(cells, y)
+  ) {
     return;
   }
-  if (cell.width === 2 && x + 1 < width) cells[index + 1] = undefined;
-  cells[index] = undefined;
+  const row = rasterRow(cells, y, true)!;
+  clearOwnedCell(cells, width, x, y);
+  if (glyphWidth === 2) clearOwnedCell(cells, width, x + 1, y);
+  row[x] = { glyph, width: glyphWidth, style };
+  if (glyphWidth === 2) row[x + 1] = { glyph: "", width: 1, style, continuationOf: x };
 }
 
-function compactFrame(cells: Array<RasterCell | undefined>, width: number, height: number): CanvasFrame {
+function clearOwnedCell(cells: RasterGrid, width: number, x: number, y: number): void {
+  const row = rasterRow(cells, y);
+  if (row === undefined) return;
+  const cell = row[x];
+  if (cell === undefined) return;
+  if (cell.continuationOf !== undefined) {
+    row[cell.continuationOf] = undefined;
+    row[x] = undefined;
+    return;
+  }
+  if (cell.width === 2 && x + 1 < width) row[x + 1] = undefined;
+  row[x] = undefined;
+}
+
+function compactFrame(
+  cells: RasterGrid,
+  width: number,
+  height: number,
+  previousFrame?: CanvasFrame,
+): CanvasFrame {
+  if (
+    cells.selectedRows !== undefined &&
+    cells.selectedRows.length === 0 &&
+    previousFrame !== undefined
+  ) {
+    return previousFrame;
+  }
   const runs: CanvasRun[] = [];
-  for (let row = 0; row < height; row += 1) {
-    let column = 0;
-    while (column < width) {
-      const cell = cells[row * width + column];
-      if (cell === undefined || cell.continuationOf !== undefined) {
-        column += 1;
-        continue;
-      }
-      const start = column;
-      const style = cell.style;
-      let text = "";
-      while (column < width) {
-        const next = cells[row * width + column];
-        if (next === undefined || next.continuationOf !== undefined || !sameStyle(style, next.style)) break;
-        text += next.glyph;
-        column += next.width;
-      }
-      runs.push({ row, column: start, text, style });
+  if (previousFrame !== undefined && cells.selectedRowSet !== undefined) {
+    for (const run of previousFrame.runs) {
+      if (!cells.selectedRowSet.has(run.row)) runs.push(run);
     }
+  }
+  if (cells.selectedRows === undefined) {
+    for (let row = 0; row < height; row += 1) compactRow(cells, width, row, runs);
+  } else {
+    for (const row of cells.selectedRows) compactRow(cells, width, row, runs);
+  }
+  if (previousFrame !== undefined) {
+    runs.sort((left, right) => left.row - right.row || left.column - right.column);
   }
   return { width, height, runs };
 }
 
-function backgroundAt(cells: Array<RasterCell | undefined>, width: number, x: number, y: number): Rgb {
-  const color = cells[y * width + x]?.style.background;
+function compactRow(cells: RasterGrid, width: number, row: number, runs: CanvasRun[]): void {
+  const raster = rasterRow(cells, row);
+  if (raster === undefined) return;
+  let column = 0;
+  while (column < width) {
+    const cell = raster[column];
+    if (cell === undefined || cell.continuationOf !== undefined) {
+      column += 1;
+      continue;
+    }
+    const start = column;
+    const style = cell.style;
+    let text = "";
+    while (column < width) {
+      const next = raster[column];
+      if (next === undefined || next.continuationOf !== undefined || !sameStyle(style, next.style)) break;
+      text += next.glyph;
+      column += next.width;
+    }
+    runs.push({ row, column: start, text, style });
+  }
+}
+
+function normalizeRows(rows: ReadonlySet<number>, height: number): readonly number[] {
+  return [...rows]
+    .filter((row) => Number.isInteger(row) && row >= 0 && row < height)
+    .sort((left, right) => left - right);
+}
+
+function selectedRow(cells: RasterGrid, row: number): boolean {
+  return cells.selectedRowSet?.has(row) ?? true;
+}
+
+function hasSelectedRow(cells: RasterGrid, start: number, end: number): boolean {
+  if (cells.selectedRows === undefined) return end > start;
+  const index = firstRowAtOrAfter(cells.selectedRows, start);
+  const row = cells.selectedRows[index];
+  return row !== undefined && row < end;
+}
+
+function forEachSelectedRow(
+  cells: RasterGrid,
+  start: number,
+  end: number,
+  visit: (row: number) => void,
+): void {
+  if (cells.selectedRows !== undefined) {
+    const first = firstRowAtOrAfter(cells.selectedRows, start);
+    for (let index = first; index < cells.selectedRows.length; index += 1) {
+      const row = cells.selectedRows[index]!;
+      if (row >= end) break;
+      visit(row);
+    }
+    return;
+  }
+  for (let row = start; row < end; row += 1) visit(row);
+}
+
+function firstRowAtOrAfter(rows: readonly number[], target: number): number {
+  let low = 0;
+  let high = rows.length;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    if (rows[middle]! < target) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  return low;
+}
+
+function rasterRow(
+  cells: RasterGrid,
+  row: number,
+  create = false,
+): Array<RasterCell | undefined> | undefined {
+  let raster = cells.rows.get(row);
+  if (raster === undefined && create) {
+    raster = [];
+    cells.rows.set(row, raster);
+  }
+  return raster;
+}
+
+function backgroundAt(cells: RasterGrid, _width: number, x: number, y: number): Rgb {
+  const color = rasterRow(cells, y)?.[x]?.style.background;
   if (color?.kind === "rgb") return { red: color.red, green: color.green, blue: color.blue };
   if (color?.kind === "indexed") return ansiColor(color.index);
   return { red: 0, green: 0, blue: 0 };

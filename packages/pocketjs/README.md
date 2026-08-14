@@ -105,14 +105,18 @@ loaded PocketJS class for visual design; this keeps class `focus:` and
 
 HostOps creates and mutates stable `view`, `text`, and `image` records in a
 generational shadow tree. Clean calls to `host.render()` return the previous
-frame without layout or raster work. A dirty render currently performs cell
-layout and bounded viewport rasterization in JavaScript, compacts adjacent
-equal-style cells into `CanvasFrame` row runs, and calls the internal Canvas
-surface. Rust then performs persistent row damage and terminal encoding.
+frame without layout or raster work. Paint-only mutations (`overflow`,
+`zIndex`, background/opacity/border paint, and text color/alignment/tracking)
+reuse the last cell geometry and flattened text. The backend refreshes computed
+styles, unions the previous row bounds of every changed subtree, and replays the
+scene only into those rows; unaffected compact runs are retained. Geometry,
+text, tree, style-reference/table, focus, and active-state changes still use
+full layout and bounded viewport rasterization as the correctness oracle.
 
-This is retained rendering, but it is not yet native incremental layout or
-sparse Canvas patching. A dirty frame submits a complete semantic Canvas frame;
-actual terminal output remains damage-limited downstream.
+This is incremental JavaScript paint, but it is not yet local Flex reflow or
+sparse Canvas transport. Every rendered frame still submits a complete semantic
+`CanvasFrame`; Rust persistent row damage limits the actual terminal output
+downstream.
 
 The implemented style subset includes cell flex row/column layout,
 grow/shrink/basis, padding/margin/gap, absolute positioning, clipping, z-order,
@@ -173,9 +177,10 @@ calls explicitly.
 - font atlases are ignored.
 
 `session.diagnostics` counts those fallbacks and reports live nodes, HostOps
-mutations, rendered/skipped frames, latest run count, missing styles, known
-unsupported properties, scheduler policy, stepped frames, idle waits, and wake
-signals.
+mutations, rendered/skipped frames, full versus incremental raster frames,
+layout passes/reused-layout frames, repainted rows, latest run count, missing
+styles, known unsupported properties, scheduler policy, stepped frames, idle
+waits, and wake signals.
 
 PocketJS 0.6 keeps its renderer root and frame handler in process-global state,
 so this package permits one active session per process. A concurrent mount
