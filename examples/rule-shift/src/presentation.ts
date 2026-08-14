@@ -73,6 +73,10 @@ export interface BoardProjection {
   readonly pitch: number;
   /** Visible ink width inside a logical cell; the remainder is a gutter. */
   readonly faceWidth: number;
+  /** Terminal rows reserved for one logical board cell. */
+  readonly rowPitch: number;
+  /** Visible ink height inside a logical cell. */
+  readonly faceHeight: number;
 }
 
 export type RuleEntityLike = Entity;
@@ -240,14 +244,14 @@ export function computePresentationLayout(
   const commandHeight = rows >= 2 ? 1 : 0;
   const command = rect(0, rows - commandHeight, columns, commandHeight);
 
-  // A wide proofing rail is earned only when the board can still display at
-  // least a two-column type face. This prevents the responsive breakpoint
-  // from shrinking the actual puzzle as the terminal becomes wider.
+  // A wide proofing rail is earned only when the board can still display
+  // substantial multi-row type blocks. The rail must never turn the game
+  // itself back into a spreadsheet of one-line labels.
   const proofWidth = clamp(Math.floor(columns * 0.24), 20, 28);
   const wideFieldWidth = Math.max(0, columns - proofWidth - 2);
   const contentHeight = Math.max(0, command.row - 2);
-  const canKeepBoard = wideFieldWidth >= boardWidth * 2 &&
-    contentHeight >= Math.min(boardHeight, 3);
+  const canKeepBoard = wideFieldWidth >= boardWidth * 5 &&
+    contentHeight >= boardHeight * 2;
   const mode: PresentationMode = columns >= 86 && rows >= 18 && canKeepBoard
     ? "wide"
     : "compact";
@@ -277,9 +281,11 @@ export function computePresentationLayout(
   let traceHeight: number;
   let separatorHeight: number;
   if (available >= boardHeight) {
-    // The rules themselves outrank narration. Only spend surplus rows on the
-    // trace once the entire board can remain visible.
-    const surplus = available - boardHeight;
+    // The rules themselves outrank narration. First reserve the tallest
+    // whole-board tile tier that fits (3, then 2, then 1 terminal rows per
+    // world cell); trace copy may use only what remains above that tier.
+    const tier = available >= boardHeight * 3 ? 3 : available >= boardHeight * 2 ? 2 : 1;
+    const surplus = available - boardHeight * tier;
     traceHeight = surplus >= 2 ? Math.min(desiredTraceHeight, surplus - 1) : 0;
     separatorHeight = traceHeight > 0 ? 1 : 0;
   } else {
@@ -438,7 +444,7 @@ export function present(
   const focus = focusEntity(snapshot);
   const focusCell = focus === undefined
     ? fallbackCursor(layout)
-    : worldToScreen(projection, focus) ?? fallbackCursor(layout);
+    : focusScreen(projection, focus) ?? fallbackCursor(layout);
   const effectSignal = selectEffectSignal(samples, projection, focusCell);
 
   return {
@@ -449,7 +455,7 @@ export function present(
     panels: buildPanels(snapshot, timeline, layout, diagnostics),
     cursor: {
       ...focusCell,
-      visible: focus !== undefined && worldToScreen(projection, focus) !== undefined,
+      visible: focus !== undefined && focusScreen(projection, focus) !== undefined,
       shape: "underline",
       token: effectSignal.token,
     },
@@ -459,8 +465,9 @@ export function present(
 
 function projectBoard(snapshot: RuleSnapshotLike, field: CellRect): BoardProjection {
   const pitch = choosePitch(snapshot.width, field.width);
+  const rowPitch = chooseRowPitch(snapshot.height, field.height);
   const visibleWidth = Math.min(snapshot.width, Math.floor(field.width / pitch));
-  const visibleHeight = Math.min(snapshot.height, field.height);
+  const visibleHeight = Math.min(snapshot.height, Math.floor(field.height / rowPitch));
   const focus = focusEntity(snapshot) ?? { x: Math.floor(snapshot.width / 2), y: Math.floor(snapshot.height / 2) };
   const worldX = clamp(focus.x - Math.floor(visibleWidth / 2), 0, Math.max(0, snapshot.width - visibleWidth));
   const worldY = clamp(focus.y - Math.floor(visibleHeight / 2), 0, Math.max(0, snapshot.height - visibleHeight));
@@ -470,9 +477,11 @@ function projectBoard(snapshot: RuleSnapshotLike, field: CellRect): BoardProject
     width: visibleWidth,
     height: visibleHeight,
     column: field.column + Math.floor((field.width - visibleWidth * pitch) / 2),
-    row: field.row + Math.floor((field.height - visibleHeight) / 2),
+    row: field.row + Math.floor((field.height - visibleHeight * rowPitch) / 2),
     pitch,
     faceWidth: Math.max(1, pitch - (pitch >= 3 ? 1 : 0)),
+    rowPitch,
+    faceHeight: rowPitch,
   };
 }
 
@@ -482,6 +491,12 @@ function choosePitch(boardWidth: number, fieldWidth: number): number {
   if (boardWidth > 0 && boardWidth * 4 <= fieldWidth) return 4;
   if (boardWidth > 0 && boardWidth * 3 <= fieldWidth) return 3;
   if (boardWidth > 0 && boardWidth * 2 <= fieldWidth) return 2;
+  return 1;
+}
+
+function chooseRowPitch(boardHeight: number, fieldHeight: number): number {
+  if (boardHeight > 0 && boardHeight * 3 <= fieldHeight) return 3;
+  if (boardHeight > 0 && boardHeight * 2 <= fieldHeight) return 2;
   return 1;
 }
 
@@ -498,12 +513,17 @@ function paintBed(
       const edge = x === 0 || y === 0 || x === snapshot.width - 1 || y === snapshot.height - 1;
       const registration = x % 5 === 0 && y % 4 === 0;
       const grain = hashCell(seed, x, y) % 17 === 0;
-      if (!edge && !registration && !grain) continue;
+      if (projection.faceHeight === 1 && !edge && !registration && !grain) continue;
+      const baseline = projection.faceHeight > 1
+        ? (edge ? "━" : registration ? "┄" : grain ? "·" : "˙")
+        : edge ? (projection.pitch > 1 ? "─" : "·") : registration ? "+" : "·";
       cells.push({
         id: `bed-${x}-${y}`,
         column: projection.column + dx * projection.pitch,
-        row: projection.row + dy,
-        text: edge ? (projection.pitch > 1 ? "─".repeat(projection.faceWidth) : "·") : registration ? "+" : "·",
+        row: projection.row + dy * projection.rowPitch + projection.faceHeight - 1,
+        text: projection.faceHeight > 1
+          ? baseline.repeat(projection.faceWidth)
+          : baseline.repeat(edge ? projection.faceWidth : 1),
         token: "lead",
         layer: "bed",
         world: { x, y },
@@ -544,16 +564,22 @@ function paintEntities(
     // instead of silently painting the later object over the first.
     if (group.length > 1 && projection.faceWidth < group.length) {
       const ids = group.map((entity) => entity.id).sort();
-      output.push({
-        id: `entity-stack-${ids.join("+")}`,
-        column: screen.column,
-        row: screen.row,
-        text: "◈",
-        token: "brass",
-        layer: "entity",
-        world: { x: anchor.x, y: anchor.y },
-        emphasis: true,
-      });
+      const lines = compositeTileLines(projection.faceWidth, projection.faceHeight);
+      const mainLine = Math.floor(lines.length / 2);
+      for (let line = 0; line < lines.length; line += 1) {
+        output.push({
+          id: line === mainLine
+            ? `entity-stack-${ids.join("+")}`
+            : `entity-stack-${ids.join("+")}:face-${line}`,
+          column: screen.column,
+          row: screen.row + line,
+          text: lines[line] ?? "",
+          token: "brass",
+          layer: "entity",
+          world: { x: anchor.x, y: anchor.y },
+          emphasis: true,
+        });
+      }
       continue;
     }
 
@@ -564,9 +590,6 @@ function paintEntities(
       const width = index === group.length - 1
         ? projection.faceWidth - slotWidth * index
         : slotWidth;
-      const text = entity.kind === "text"
-        ? wordFace(entityWord(entity), width)
-        : objectFace(entity.noun, width);
       const activeRule = entity.kind === "text" && activeRuleTextIds.has(entity.id);
       const calibration = entity.kind === "object"
         ? samples.find((sample) => sample.kind === "calibrate" && cueAffectsEntity(sample, entity))
@@ -585,17 +608,24 @@ function paintEntities(
         : calibrationFlash
           ? "brass"
         : entity.kind === "text" && width >= 2 ? "lead" : undefined;
-      output.push({
-        id: `entity-${entity.id}`,
-        column: screen.column + slotWidth * index,
-        row: screen.row,
-        text,
-        token,
-        background,
-        layer: "entity",
-        world: { x: entity.x, y: entity.y },
-        emphasis: activeIds.has(entity.id) || activeRule || calibration !== undefined || entity.kind === "text" || group.length > 1,
-      });
+      const lines = entity.kind === "text"
+        ? wordTileLines(entityWord(entity), width, projection.faceHeight)
+        : objectTileLines(entity.noun, width, projection.faceHeight);
+      const mainLine = Math.floor(lines.length / 2);
+      for (let line = 0; line < lines.length; line += 1) {
+        output.push({
+          id: line === mainLine ? `entity-${entity.id}` : `entity-${entity.id}:face-${line}`,
+          column: screen.column + slotWidth * index,
+          row: screen.row + line,
+          text: lines[line] ?? "",
+          token,
+          background,
+          layer: "entity",
+          world: { x: entity.x, y: entity.y },
+          emphasis: activeIds.has(entity.id) || activeRule || calibration !== undefined || entity.kind === "text" || group.length > 1,
+          dim: line !== mainLine && entity.kind === "object" && !activeIds.has(entity.id),
+        });
+      }
     }
   }
   return output;
@@ -610,14 +640,21 @@ function paintEffects(
   for (const sample of samples) {
     if (sample.kind === "calibrate") {
       const rows = sample.ruleRows?.length ? sample.ruleRows : [sample.anchor.y];
-      const sweepX = projection.worldX + Math.min(
-        projection.width - 1,
-        Math.max(0, Math.floor(sample.progress * projection.width)),
+      const sweepSpan = Math.max(1, projection.width * projection.pitch - 1);
+      const sweepColumn = projection.column + Math.min(
+        sweepSpan,
+        Math.max(0, Math.floor(sample.progress * sweepSpan)),
       );
       for (const row of rows) {
-        const screen = worldToScreen(projection, { x: sweepX, y: row });
+        const point = { x: projection.worldX, y: row };
+        const screen = worldToScreen(projection, point);
         if (screen === undefined) continue;
-        output.push(effectCell(sample, screen, projection.faceWidth >= 3 ? "━━" : "━", "brass", { x: sweepX, y: row }, `shuttle-${row}`));
+        for (let line = 0; line < projection.faceHeight; line += 1) {
+          appendEffect(output, sample, projection, {
+            column: sweepColumn,
+            row: screen.row + line,
+          }, line === Math.floor(projection.faceHeight / 2) ? "◆" : "┃", "brass", point, `shuttle-${row}-${line}`);
+        }
       }
 
       const ruleCells = sample.ruleCells ?? [];
@@ -628,34 +665,33 @@ function paintEffects(
         if (sample.progress < threshold) continue;
         const screen = worldToScreen(projection, point);
         if (screen === undefined) continue;
-        const markerColumn = projection.pitch > projection.faceWidth
-          ? screen.column + projection.faceWidth
-          : screen.column;
-        output.push(effectCell(
-          sample,
-          { column: markerColumn, row: screen.row },
-          sample.progress > 0.82 ? "·" : "▏",
-          "brass",
-          point,
-          `rule-${index}`,
-        ));
+        const markerColumn = screen.column + Math.max(0, projection.faceWidth - 1);
+        appendEffect(output, sample, projection, {
+          column: markerColumn,
+          row: screen.row,
+        }, sample.progress > 0.82 ? "·" : "◆", "brass", point, `rule-${index}`);
+        if (projection.faceHeight > 1) {
+          appendEffect(output, sample, projection, {
+            column: screen.column,
+            row: screen.row + projection.faceHeight - 1,
+          }, "▰".repeat(Math.min(2, projection.faceWidth)), "brass", point, `rule-${index}-seat`);
+        }
       }
 
       for (const entity of snapshot.entities) {
         if (entity.kind !== "object" || !cueAffectsEntity(sample, entity)) continue;
         const screen = worldToScreen(projection, entity);
         if (screen === undefined) continue;
-        const markerColumn = projection.pitch > projection.faceWidth
-          ? screen.column + projection.faceWidth
-          : screen.column;
-        output.push(effectCell(
-          sample,
-          { column: markerColumn, row: screen.row },
-          Math.floor(sample.progress * 12) % 2 === 0 ? "┃" : "│",
-          "cyan",
-          entity,
-          `object-${entity.id}`,
-        ));
+        const pulse = Math.floor(sample.progress * 12) % 2 === 0;
+        const sparks = tileCornerOffsets(projection, pulse ? 0 : 1);
+        for (let index = 0; index < sparks.length; index += 1) {
+          const offset = sparks[index];
+          if (offset === undefined) continue;
+          appendEffect(output, sample, projection, {
+            column: screen.column + offset.column,
+            row: screen.row + offset.row,
+          }, pulse ? "✦" : "·", "cyan", entity, index === 0 ? `object-${entity.id}` : `object-${entity.id}-${index}`);
+        }
       }
       continue;
     }
@@ -665,40 +701,106 @@ function paintEffects(
       for (const point of diamondRing(sample.anchor, radius)) {
         const screen = worldToScreen(projection, point);
         if (screen === undefined) continue;
-        output.push(effectCell(sample, screen, sample.progress > 0.72 ? "·" : "✦", "brass", point));
+        appendEffect(output, sample, projection, tileCenter(screen, projection), sample.progress > 0.72 ? "·" : "✦", "brass", point);
+      }
+      const center = worldToScreen(projection, sample.anchor);
+      if (center !== undefined) {
+        const burst = radialParticleOffsets(sample.progress, projection, 12, 2.4);
+        for (let index = 0; index < burst.length; index += 1) {
+          const offset = burst[index];
+          if (offset === undefined) continue;
+          const anchor = tileCenter(center, projection);
+          appendEffect(output, sample, projection, {
+            column: anchor.column + offset.column,
+            row: anchor.row + offset.row,
+          }, particleGlyph(sample.progress, index, ["✦", "◆", "·"]), "brass", sample.anchor, `burst-${index}`);
+        }
       }
       continue;
     }
 
     if (sample.kind === "move" || sample.kind === "push") {
-      if (sample.from === undefined) continue;
-      const screen = worldToScreen(projection, sample.from);
-      if (screen === undefined) continue;
-      const marker = sample.kind === "push"
-        ? proofMarkPosition(screen, projection)
-        : screen;
-      output.push(effectCell(
-        sample,
-        marker,
-        sample.kind === "push" ? directionGlyph(sample.from, sample.to) : "·",
-        sample.kind === "push" ? "brass" : "lead",
-        sample.from,
-      ));
+      if (sample.from === undefined || sample.to === undefined) continue;
+      const from = worldToScreen(projection, sample.from);
+      const to = worldToScreen(projection, sample.to);
+      if (from === undefined || to === undefined) continue;
+      const fromCenter = tileCenter(from, projection);
+      const toCenter = tileCenter(to, projection);
+      const count = sample.kind === "push" ? 6 : 4;
+      const phase = Math.floor(sample.progress * 6);
+      for (let index = 0; index < count; index += 1) {
+        const lag = index * (sample.kind === "push" ? 0.075 : 0.11);
+        const localProgress = clamp(sample.progress - lag, 0, 1);
+        const point = interpolateScreen(fromCenter, toCenter, easeOut(localProgress));
+        const glyph = index === 0
+          ? movingDirectionGlyph(sample.from, sample.to, sample.kind === "push", phase)
+          : particleGlyph(sample.progress, index, sample.kind === "push" ? ["»", "✦", "·"] : ["·", "›", "✦"]);
+        const token: RuleShiftToken = sample.kind === "push"
+          ? index === 0 && phase % 2 === 1 ? "paper" : "brass"
+          : index === 0 ? (phase % 2 === 0 ? "cyan" : "paper") : "lead";
+        appendEffect(output, sample, projection, point, glyph, token, sample.from, `trail-${index}`);
+      }
       continue;
     }
 
     const screen = worldToScreen(projection, sample.anchor);
     if (screen === undefined) continue;
-    const flash = Math.floor(sample.progress * 8) % 2 === 0;
-    output.push(effectCell(
-      sample,
-      proofMarkPosition(screen, projection),
-      sample.kind === "blocked" ? (flash ? "╳" : "×") : (flash ? "✣" : "✦"),
-      sample.kind === "blocked" ? "vermilion" : "cyan",
-      sample.anchor,
-    ));
+    const center = tileCenter(screen, projection);
+    if (sample.kind === "blocked") {
+      const stage = Math.min(3, Math.floor(sample.progress * 4));
+      const radius = Math.max(1, Math.min(projection.faceWidth, 1 + stage));
+      const glyphs = ["╳", "×", "✕", "·"] as const;
+      const positions = [
+        { column: center.column - radius, row: center.row },
+        { column: center.column + radius, row: center.row },
+        { column: center.column, row: center.row - Math.min(stage, projection.faceHeight - 1) },
+        { column: center.column, row: center.row + Math.min(stage, projection.faceHeight - 1) },
+      ];
+      for (let index = 0; index < positions.length; index += 1) {
+        appendEffect(output, sample, projection, positions[index]!, glyphs[(stage + index) % glyphs.length]!, "vermilion", sample.anchor, `jam-${index}`);
+      }
+      continue;
+    }
+
+    // Transformation is a portable syntax burst: cyan sorts rotate around
+    // the recut face before settling into a new proof mark.
+    const orbit = radialParticleOffsets(sample.progress, projection, 8, 1.65);
+    for (let index = 0; index < orbit.length; index += 1) {
+      const offset = orbit[index];
+      if (offset === undefined) continue;
+      appendEffect(output, sample, projection, {
+        column: center.column + offset.column,
+        row: center.row + offset.row,
+      }, particleGlyph(sample.progress, index, ["✣", "✦", "◆", "·"]), "cyan", sample.anchor, `recut-${index}`);
+    }
   }
   return output;
+}
+
+function appendEffect(
+  output: PresentationCell[],
+  cue: SampledPrintCue,
+  projection: BoardProjection,
+  screen: Readonly<{ column: number; row: number }>,
+  text: string,
+  token: RuleShiftToken,
+  world: Readonly<Point>,
+  idSuffix = `${world.x}-${world.y}`,
+): void {
+  const left = projection.column;
+  const right = projection.column + projection.width * projection.pitch;
+  const top = projection.row;
+  const bottom = projection.row + projection.height * projection.rowPitch;
+  if (screen.row < top || screen.row >= bottom || screen.column >= right) return;
+  let column = screen.column;
+  let visible = text;
+  if (column < left) {
+    visible = [...visible].slice(left - column).join("");
+    column = left;
+  }
+  visible = clip(visible, right - column);
+  if (visible.length === 0) return;
+  output.push(effectCell(cue, { column, row: screen.row }, visible, token, world, idSuffix));
 }
 
 function effectCell(
@@ -722,16 +824,105 @@ function effectCell(
   };
 }
 
-function proofMarkPosition(
+function tileCenter(
   screen: Readonly<{ column: number; row: number }>,
   projection: BoardProjection,
 ): { column: number; row: number } {
   return {
-    column: projection.pitch > projection.faceWidth
-      ? screen.column + projection.faceWidth
-      : screen.column,
-    row: screen.row,
+    column: screen.column + Math.floor((projection.faceWidth - 1) / 2),
+    row: screen.row + Math.floor((projection.faceHeight - 1) / 2),
   };
+}
+
+function interpolateScreen(
+  from: Readonly<{ column: number; row: number }>,
+  to: Readonly<{ column: number; row: number }>,
+  progress: number,
+): { column: number; row: number } {
+  return {
+    column: Math.round(from.column + (to.column - from.column) * progress),
+    row: Math.round(from.row + (to.row - from.row) * progress),
+  };
+}
+
+function easeOut(progress: number): number {
+  const remaining = 1 - clamp(progress, 0, 1);
+  return 1 - remaining * remaining;
+}
+
+function movingDirectionGlyph(
+  from: Readonly<Point>,
+  to: Readonly<Point>,
+  pushed: boolean,
+  phase: number,
+): string {
+  const horizontal = to.x !== from.x;
+  if (horizontal) {
+    if (to.x > from.x) return pushed && phase % 2 === 0 ? "»" : "›";
+    return pushed && phase % 2 === 0 ? "«" : "‹";
+  }
+  if (to.y > from.y) return pushed && phase % 2 === 0 ? "▼" : "⌄";
+  return pushed && phase % 2 === 0 ? "▲" : "⌃";
+}
+
+function particleGlyph(
+  progress: number,
+  index: number,
+  glyphs: readonly string[],
+): string {
+  const phase = Math.floor(progress * glyphs.length * 2);
+  return glyphs[(phase + index) % glyphs.length] ?? "·";
+}
+
+function tileCornerOffsets(
+  projection: BoardProjection,
+  phase: number,
+): readonly Readonly<{ column: number; row: number }>[] {
+  const right = Math.max(0, projection.faceWidth - 1);
+  const bottom = Math.max(0, projection.faceHeight - 1);
+  if (phase % 2 === 0) {
+    return [
+      { column: 0, row: 0 },
+      { column: right, row: bottom },
+      { column: right, row: 0 },
+      { column: 0, row: bottom },
+    ];
+  }
+  return [
+    { column: Math.floor(right / 2), row: 0 },
+    { column: right, row: Math.floor(bottom / 2) },
+    { column: Math.floor(right / 2), row: bottom },
+    { column: 0, row: Math.floor(bottom / 2) },
+  ];
+}
+
+function radialParticleOffsets(
+  progress: number,
+  projection: BoardProjection,
+  count: number,
+  reach: number,
+): readonly Readonly<{ column: number; row: number }>[] {
+  const directions = [
+    { column: 1, row: 0 },
+    { column: 1, row: -1 },
+    { column: 0, row: -1 },
+    { column: -1, row: -1 },
+    { column: -1, row: 0 },
+    { column: -1, row: 1 },
+    { column: 0, row: 1 },
+    { column: 1, row: 1 },
+  ] as const;
+  const phase = Math.floor(progress * 8);
+  const output: { column: number; row: number }[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const direction = directions[(index + phase) % directions.length]!;
+    const ring = 0.55 + progress * reach + (index % 3) * 0.18;
+    output.push({
+      column: Math.round(direction.column * ring * Math.max(1, projection.faceWidth / 2)),
+      row: Math.round(direction.row * ring * Math.max(1, projection.faceHeight / 2)),
+    });
+  }
+  return output;
 }
 
 function buildPanels(
@@ -897,7 +1088,7 @@ function selectEffectSignal(
   }
   return {
     kind: selected.kind,
-    anchor: worldToScreen(projection, selected.anchor) ?? fallback,
+    anchor: focusScreen(projection, selected.anchor) ?? fallback,
     token: effectToken(selected.kind),
     startedAt: selected.startsAt,
     durationMs: selected.durationMs,
@@ -945,6 +1136,49 @@ function normalizedWord(value: unknown): string {
 
 function entityWord(entity: TextEntity): string {
   return entity.word.toLowerCase();
+}
+
+function wordTileLines(word: string, width: number, height: number): readonly string[] {
+  const face = wordFace(word, width);
+  if (height <= 1) return [face];
+  const top = width >= 3
+    ? `╭${"─".repeat(width - 2)}╮`
+    : width === 2 ? "▀▀" : "▴";
+  if (height === 2) return [top, face];
+  const bottom = width >= 3
+    ? `╰${"─".repeat(width - 2)}╯`
+    : width === 2 ? "▄▄" : "▾";
+  return [top, face, bottom];
+}
+
+function objectTileLines(noun: string, width: number, height: number): readonly string[] {
+  if (height <= 1) return [objectFace(noun, width)];
+  const patterns: Readonly<Record<string, readonly [string, string, string]>> = {
+    mote: ["· ╵ ·", "· ✦ ·", "· ╷ ·"],
+    orb: [" ╭─╮ ", " │◉│ ", " ╰─╯ "],
+    wall: ["▥▥▥▥▥", "▥ ▥ ▥", "▥▥▥▥▥"],
+    goal: [" ╲│╱ ", " ◇◆◇ ", " ╱│╲ "],
+    crate: ["┏━━━┓", "┃ ▣ ┃", "┗━━━┛"],
+    bloom: [" ✣✣ ", " ✣✿✣ ", " ╱╲  "],
+    gate: ["╫ ╫ ╫", "╫╪╫╪╫", "╫ ╫ ╫"],
+  };
+  const fallbackGlyph = OBJECT_GLYPHS[noun.toLowerCase()] ?? noun[0]?.toUpperCase() ?? "?";
+  const pattern = patterns[noun.toLowerCase()] ?? [" · · ", `· ${fallbackGlyph} ·`, " · · "];
+  const fitted = pattern.map((line) => fitSpriteLine(line, width));
+  return height === 2 ? fitted.slice(0, 2) : fitted;
+}
+
+function compositeTileLines(width: number, height: number): readonly string[] {
+  if (height <= 1) return [center("◈", width)];
+  const lines = [center("╲ ╱", width), center("◈", width), center("╱ ╲", width)];
+  return height === 2 ? lines.slice(0, 2) : lines;
+}
+
+function fitSpriteLine(line: string, width: number): string {
+  const glyphs = [...line];
+  if (glyphs.length <= width) return center(line, width);
+  const offset = Math.floor((glyphs.length - width) / 2);
+  return glyphs.slice(offset, offset + width).join("");
 }
 
 function wordFace(word: string, width: number): string {
@@ -1068,7 +1302,19 @@ function worldToScreen(
   if (x < 0 || y < 0 || x >= projection.width || y >= projection.height) return undefined;
   return {
     column: projection.column + x * projection.pitch,
-    row: projection.row + y,
+    row: projection.row + y * projection.rowPitch,
+  };
+}
+
+function focusScreen(
+  projection: BoardProjection,
+  world: Readonly<Point>,
+): { column: number; row: number } | undefined {
+  const screen = worldToScreen(projection, world);
+  if (screen === undefined) return undefined;
+  return {
+    column: screen.column + Math.floor((projection.faceWidth - 1) / 2),
+    row: screen.row + projection.faceHeight - 1,
   };
 }
 
@@ -1088,14 +1334,6 @@ function diamondRing(centerPoint: Readonly<Point>, radius: number): readonly Poi
     if (dy !== 0) points.push({ x: centerPoint.x + dx, y: centerPoint.y - dy });
   }
   return points;
-}
-
-function directionGlyph(from: Readonly<Point>, to?: Readonly<Point>): string {
-  if (to === undefined) return "›";
-  if (to.x > from.x) return "›";
-  if (to.x < from.x) return "‹";
-  if (to.y > from.y) return "⌄";
-  return "⌃";
 }
 
 function compareCells(left: PresentationCell, right: PresentationCell): number {
