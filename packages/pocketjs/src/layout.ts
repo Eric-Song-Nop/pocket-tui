@@ -21,24 +21,68 @@ interface FlexItem {
   marginCrossAfter: number;
 }
 
+interface LayoutEngine {
+  readonly layout: (node: HostNode, rect: Rect) => void;
+  readonly layoutAbsolute: (node: HostNode, inner: Rect) => void;
+  readonly result: () => LayoutResult;
+}
+
 export function layoutTree(
   root: HostNode,
   columns: number,
   rows: number,
   resolveStyle: StyleResolver,
 ): LayoutResult {
+  const engine = createLayoutEngine(resolveStyle);
+  engine.layout(root, { x: 0, y: 0, width: columns, height: rows });
+  return engine.result();
+}
+
+/**
+ * Lays out one absolute-positioned subtree against a cached parent entry.
+ *
+ * Absolute children do not participate in their parent's flex sizing, so this
+ * produces the same subtree entries as a full layout while leaving the parent
+ * and its other children untouched. Callers are responsible for ensuring that
+ * the cached parent geometry is still valid.
+ */
+export function layoutAbsoluteSubtree(
+  root: HostNode,
+  parent: LayoutEntry,
+  resolveStyle: StyleResolver,
+): LayoutResult {
+  if (parent.node.type !== NODE.view) {
+    throw new TypeError("absolute subtrees require a view parent");
+  }
+
+  const engine = createLayoutEngine(resolveStyle);
+  const inner = innerRect(parent.rect, parent.style);
+  const style = resolveStyle(root);
+  if (style.display === ENUM.displayNone) {
+    engine.layout(root, { x: inner.x, y: inner.y, width: 0, height: 0 });
+  } else {
+    if (style.position !== ENUM.absolute) {
+      throw new TypeError("localized subtree root must be absolutely positioned");
+    }
+    engine.layoutAbsolute(root, inner);
+  }
+  return engine.result();
+}
+
+function createLayoutEngine(resolveStyle: StyleResolver): LayoutEngine {
   const entries = new Map<number, LayoutEntry>();
   const flattenedText = new Map<number, string>();
-  const textFor = (node: HostNode): string => {
+
+  function textFor(node: HostNode): string {
     const cached = flattenedText.get(node.id);
     if (cached !== undefined) return cached;
     let value = node.text;
     for (const child of node.children) value += textFor(child);
     flattenedText.set(node.id, value);
     return value;
-  };
+  }
 
-  const measure = (node: HostNode, availableWidth: number, availableHeight: number): Measured => {
+  function measure(node: HostNode, availableWidth: number, availableHeight: number): Measured {
     const style = resolveStyle(node);
     if (style.display === ENUM.displayNone) return { width: 0, height: 0 };
     const boundedWidth = Math.max(0, availableWidth);
@@ -87,9 +131,9 @@ export function layoutTree(
       width: resolveDimension(style.width, natural.width, boundedWidth, style.minWidth, style.maxWidth),
       height: resolveDimension(style.height, natural.height, boundedHeight, style.minHeight, style.maxHeight),
     };
-  };
+  }
 
-  const layout = (node: HostNode, rect: Rect): void => {
+  function layout(node: HostNode, rect: Rect): void {
     const style = resolveStyle(node);
     const normalized = normalizeRect(rect);
     entries.set(node.id, { node, style, rect: normalized });
@@ -102,12 +146,7 @@ export function layoutTree(
       return;
     }
 
-    const inner: Rect = {
-      x: normalized.x + style.padding.left,
-      y: normalized.y + style.padding.top,
-      width: Math.max(0, normalized.width - style.padding.left - style.padding.right),
-      height: Math.max(0, normalized.height - style.padding.top - style.padding.bottom),
-    };
+    const inner = innerRect(normalized, style);
     const relative: HostNode[] = [];
     const absolute: HostNode[] = [];
     for (const child of node.children) {
@@ -123,48 +162,55 @@ export function layoutTree(
 
     layoutFlexChildren(relative, inner, style, measure, layout, resolveStyle);
     for (const child of absolute) {
-      const childStyle = resolveStyle(child);
-      const measured = measure(child, inner.width, inner.height);
-      const left = childStyle.inset.left;
-      const right = childStyle.inset.right;
-      const top = childStyle.inset.top;
-      const bottom = childStyle.inset.bottom;
-      const width = resolveAbsoluteSize(
-        childStyle.width,
-        measured.width,
-        inner.width,
-        left,
-        right,
-        childStyle.minWidth,
-        childStyle.maxWidth,
-      );
-      const height = resolveAbsoluteSize(
-        childStyle.height,
-        measured.height,
-        inner.height,
-        top,
-        bottom,
-        childStyle.minHeight,
-        childStyle.maxHeight,
-      );
-      const x =
-        left !== undefined
-          ? inner.x + cells(left) + childStyle.margin.left
-          : right !== undefined
-            ? inner.x + inner.width - cells(right) - width - childStyle.margin.right
-            : inner.x + childStyle.margin.left;
-      const y =
-        top !== undefined
-          ? inner.y + cells(top) + childStyle.margin.top
-          : bottom !== undefined
-            ? inner.y + inner.height - cells(bottom) - height - childStyle.margin.bottom
-            : inner.y + childStyle.margin.top;
-      layout(child, { x, y, width, height });
+      layoutAbsolute(child, inner);
     }
-  };
+  }
 
-  layout(root, { x: 0, y: 0, width: columns, height: rows });
-  return { entries, flattenedText };
+  function layoutAbsolute(node: HostNode, inner: Rect): void {
+    const style = resolveStyle(node);
+    const measured = measure(node, inner.width, inner.height);
+    const left = style.inset.left;
+    const right = style.inset.right;
+    const top = style.inset.top;
+    const bottom = style.inset.bottom;
+    const width = resolveAbsoluteSize(
+      style.width,
+      measured.width,
+      inner.width,
+      left,
+      right,
+      style.minWidth,
+      style.maxWidth,
+    );
+    const height = resolveAbsoluteSize(
+      style.height,
+      measured.height,
+      inner.height,
+      top,
+      bottom,
+      style.minHeight,
+      style.maxHeight,
+    );
+    const x =
+      left !== undefined
+        ? inner.x + cells(left) + style.margin.left
+        : right !== undefined
+          ? inner.x + inner.width - cells(right) - width - style.margin.right
+          : inner.x + style.margin.left;
+    const y =
+      top !== undefined
+        ? inner.y + cells(top) + style.margin.top
+        : bottom !== undefined
+          ? inner.y + inner.height - cells(bottom) - height - style.margin.bottom
+          : inner.y + style.margin.top;
+    layout(node, { x, y, width, height });
+  }
+
+  return {
+    layout,
+    layoutAbsolute,
+    result: () => ({ entries, flattenedText }),
+  };
 }
 
 function layoutFlexChildren(
@@ -324,6 +370,15 @@ function resolveDimension(
 
 function cells(value: number): number {
   return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
+}
+
+function innerRect(rect: Rect, style: ComputedStyle): Rect {
+  return {
+    x: rect.x + style.padding.left,
+    y: rect.y + style.padding.top,
+    width: Math.max(0, rect.width - style.padding.left - style.padding.right),
+    height: Math.max(0, rect.height - style.padding.top - style.padding.bottom),
+  };
 }
 
 function normalizeRect(rect: Rect): Rect {

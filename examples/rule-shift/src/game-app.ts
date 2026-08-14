@@ -109,7 +109,7 @@ export function RuleShift(options: RuleShiftOptions): NodeMirror {
   for (let index = 0; index < RUN_POOL_SIZE; index += 1) {
     const node = pocketText(
       () => runs()[index]?.text ?? "",
-      () => runStyle(runs()[index]),
+      () => ruleShiftRunStyle(runs()[index]),
     );
     appendPocketChildren(root, node);
   }
@@ -431,7 +431,8 @@ function keyedBucket(
   return output;
 }
 
-function runStyle(run: RenderRun | undefined): PocketStyle {
+/** Project one retained run-pool slot into PocketJS inline style properties. */
+export function ruleShiftRunStyle(run: RenderRun | undefined): PocketStyle {
   if (run === undefined || run.text.length === 0) {
     return {
       display: 1,
@@ -451,9 +452,12 @@ function runStyle(run: RenderRun | undefined): PocketStyle {
     height: 1,
     zIndex: run.zIndex,
     textColor: tokenHex(run.token),
+    // PocketJS 0.6 only sends keys present in the next inline style object.
+    // Explicitly clear a pooled slot's prior background when its new run has
+    // none, otherwise the retained HostNode keeps the stale color.
+    bgColor: run.background === undefined ? 0 : tokenHex(run.background),
     opacity: run.dim ? 0.42 : run.emphasis ? 1 : 0.82,
   };
-  if (run.background !== undefined) base.bgColor = tokenHex(run.background);
   return base;
 }
 

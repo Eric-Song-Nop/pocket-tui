@@ -18,6 +18,7 @@ import type { GameSnapshot } from "./engine.js";
 import {
   RULE_SHIFT_FPS,
   RuleShift,
+  ruleShiftRunStyle,
   type RuleShiftContext,
 } from "./game-app.js";
 import {
@@ -67,6 +68,25 @@ class DemoSurface implements PocketTuiSurface {
 }
 
 describe("RULE//SHIFT PocketJS backend integration", () => {
+  test("explicitly clears a pooled slot background when the next run has none", () => {
+    const run = {
+      key: "pooled-slot",
+      text: "RULE",
+      column: 4,
+      row: 3,
+      token: "paper" as const,
+      background: "brass" as const,
+      emphasis: false,
+      dim: false,
+      zIndex: 2,
+    };
+
+    expect(ruleShiftRunStyle(run).bgColor).not.toBe(0);
+    const cleared = ruleShiftRunStyle({ ...run, background: undefined });
+    expect(Object.hasOwn(cleared, "bgColor")).toBe(true);
+    expect(cleared.bgColor).toBe(0);
+  });
+
   test("mounts, updates, resizes, and tears down the retained application", async () => {
     const surface = new DemoSurface();
     const host = createPocketTuiHost({ surface, colorMode: "truecolor" });
@@ -118,6 +138,8 @@ describe("RULE//SHIFT PocketJS backend integration", () => {
 
       const liveNodes = host.diagnostics.liveNodes;
       const mastheadNode = textNodeId(host.snapshot(), "RULE//SHIFT  MOVABLE TYPE PROOF");
+      const layoutBaseline = host.diagnostics;
+      const retainedLayoutNodes = host.snapshot().filter((node) => node.rect !== undefined).length;
       expect(mastheadNode).toBeDefined();
 
       // A terminal may deliver repeated movement in one text record. Queue
@@ -184,7 +206,16 @@ describe("RULE//SHIFT PocketJS backend integration", () => {
         expect(textNodeId(host.snapshot(), "RULE//SHIFT  MOVABLE TYPE PROOF")).toBe(mastheadNode);
       }
 
+      const activeLayout = host.diagnostics;
+      const localizedFrames =
+        activeLayout.localizedLayoutFrames - layoutBaseline.localizedLayoutFrames;
+      const localizedNodes = activeLayout.layoutNodes - layoutBaseline.layoutNodes;
+      expect(activeLayout.fullLayoutFrames).toBe(layoutBaseline.fullLayoutFrames);
+      expect(localizedFrames).toBeGreaterThan(0);
+      expect(localizedNodes / (localizedFrames * retainedLayoutNodes)).toBeLessThan(0.25);
+
       // Resize changes the layout projection, not the engine or level state.
+      const fullLayoutsBeforeResize = host.diagnostics.fullLayoutFrames;
       surface.size = { columns: 72, rows: 24 };
       surface.inputs.push({ kind: "resize", columns: 72, rows: 24 });
       await stepMany(session, 3);
@@ -194,6 +225,7 @@ describe("RULE//SHIFT PocketJS backend integration", () => {
       expect(host.frame.height).toBe(24);
       expect(host.diagnostics.liveNodes).toBe(liveNodes);
       expect(textNodeId(host.snapshot(), "RULE//SHIFT  MOVABLE TYPE PROOF")).toBe(mastheadNode);
+      expect(host.diagnostics.fullLayoutFrames).toBe(fullLayoutsBeforeResize + 1);
     } finally {
       await session?.close();
     }

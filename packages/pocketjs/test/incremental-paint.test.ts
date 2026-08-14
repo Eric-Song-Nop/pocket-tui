@@ -65,7 +65,12 @@ describe("PocketJS incremental paint", () => {
 
     expect(host.diagnostics).toMatchObject({
       layoutPasses: 0,
+      fullLayoutFrames: 0,
+      localizedLayoutFrames: 0,
       reusedLayoutFrames: 0,
+      lastLayoutNodes: 0,
+      layoutNodes: 0,
+      lastRelayoutRoots: 0,
       fullRasterFrames: 0,
       incrementalRasterFrames: 0,
       lastRepaintedRows: 0,
@@ -78,7 +83,12 @@ describe("PocketJS incremental paint", () => {
       renderedFrames: 1,
       skippedFrames: 0,
       layoutPasses: 1,
+      fullLayoutFrames: 1,
+      localizedLayoutFrames: 0,
       reusedLayoutFrames: 0,
+      lastLayoutNodes: 2,
+      layoutNodes: 2,
+      lastRelayoutRoots: 1,
       fullRasterFrames: 1,
       incrementalRasterFrames: 0,
       lastRepaintedRows: 5,
@@ -178,7 +188,7 @@ describe("PocketJS incremental paint", () => {
     expect(childPartial).toEqual(childOracle);
   });
 
-  test("coalesces disjoint paint rows and lets full mutations dominate either ordering", () => {
+  test("coalesces disjoint rows and lets localized layout dominate paint ordering", () => {
     const surface = new RecordingSurface({ columns: 10, rows: 7 });
     const host = createPocketTuiHost({ surface, colorMode: "truecolor" });
     const top = host.ops.createNode(NODE.view);
@@ -202,25 +212,25 @@ describe("PocketJS incremental paint", () => {
     });
     expect(partial).toEqual(host.render(true));
 
-    assertFullInvalidation(
+    assertLocalizedInvalidation(
       host,
       () => {
         host.ops.setProp(top, PROP.bgColor, 0xff00_ff00);
         host.ops.setProp(top, PROP.width, 5);
       },
-      7,
+      1,
     );
-    assertFullInvalidation(
+    assertLocalizedInvalidation(
       host,
       () => {
         host.ops.setProp(bottom, PROP.height, 2);
         host.ops.setProp(bottom, PROP.opacity, 0.5);
       },
-      7,
+      2,
     );
   });
 
-  test("keeps geometry, text, tree, style, focus, active, and resize mutations on the full oracle", () => {
+  test("keeps flow geometry, tree, style, focus, active, and resize on the full oracle", () => {
     const surface = new RecordingSurface({ columns: 14, rows: 6 });
     const host = createPocketTuiHost({ surface, colorMode: "truecolor" });
     const panel = host.ops.createNode(NODE.view);
@@ -617,6 +627,8 @@ function assertFullInvalidation(
   host.render();
   const after = host.diagnostics;
   expect(after.layoutPasses).toBe(before.layoutPasses + 1);
+  expect(after.fullLayoutFrames).toBe(before.fullLayoutFrames + 1);
+  expect(after.localizedLayoutFrames).toBe(before.localizedLayoutFrames);
   expect(after.reusedLayoutFrames).toBe(before.reusedLayoutFrames);
   expect(after.fullRasterFrames).toBe(before.fullRasterFrames + 1);
   expect(after.incrementalRasterFrames).toBe(before.incrementalRasterFrames);
@@ -624,16 +636,44 @@ function assertFullInvalidation(
   expect(after.repaintedRows).toBe(before.repaintedRows + repaintedRows);
 }
 
+function assertLocalizedInvalidation(
+  host: ReturnType<typeof createPocketTuiHost>,
+  mutate: () => void,
+  repaintedRows: number,
+): void {
+  const before = host.diagnostics;
+  mutate();
+  expect(host.renderPending).toBe(true);
+  const incremental = host.render();
+  const after = host.diagnostics;
+  expect(after.layoutPasses).toBe(before.layoutPasses + 1);
+  expect(after.fullLayoutFrames).toBe(before.fullLayoutFrames);
+  expect(after.localizedLayoutFrames).toBe(before.localizedLayoutFrames + 1);
+  expect(after.reusedLayoutFrames).toBe(before.reusedLayoutFrames);
+  expect(after.fullRasterFrames).toBe(before.fullRasterFrames);
+  expect(after.incrementalRasterFrames).toBe(before.incrementalRasterFrames + 1);
+  expect(after.lastRepaintedRows).toBe(repaintedRows);
+  expect(after.repaintedRows).toBe(before.repaintedRows + repaintedRows);
+  expect(incremental).toEqual(host.render(true));
+}
+
 function expectDiagnosticSums(host: ReturnType<typeof createPocketTuiHost>): void {
   const diagnostics = host.diagnostics;
   expect(diagnostics.renderedFrames).toBe(
-    diagnostics.layoutPasses + diagnostics.reusedLayoutFrames,
+    diagnostics.fullLayoutFrames +
+      diagnostics.localizedLayoutFrames +
+      diagnostics.reusedLayoutFrames,
+  );
+  expect(diagnostics.layoutPasses).toBe(
+    diagnostics.fullLayoutFrames + diagnostics.localizedLayoutFrames,
   );
   expect(diagnostics.renderedFrames).toBe(
     diagnostics.fullRasterFrames + diagnostics.incrementalRasterFrames,
   );
-  expect(diagnostics.layoutPasses).toBe(diagnostics.fullRasterFrames);
-  expect(diagnostics.reusedLayoutFrames).toBe(diagnostics.incrementalRasterFrames);
+  expect(diagnostics.fullLayoutFrames).toBe(diagnostics.fullRasterFrames);
+  expect(diagnostics.incrementalRasterFrames).toBe(
+    diagnostics.localizedLayoutFrames + diagnostics.reusedLayoutFrames,
+  );
 }
 
 function styleTable(): Uint8Array {
