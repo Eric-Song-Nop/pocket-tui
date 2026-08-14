@@ -184,7 +184,11 @@ export function RuleShift(options: RuleShiftOptions): NodeMirror {
   return root;
 }
 
-function initialTimeline(snapshot: GameSnapshot, startedAt = 0): PrintTimeline {
+function initialTimeline(
+  snapshot: GameSnapshot,
+  startedAt = 0,
+  transition: "initial-load" | "undo" | "restart" | "stage-change" = "initial-load",
+): PrintTimeline {
   const coordinates = snapshot.rules.clauses.flatMap((clause) => clause.cells);
   const ruleCells = [...new Map(coordinates.map((point) => [`${point.x},${point.y}`, point])).values()];
   const rows = [...new Set(coordinates.map((point) => point.y))].sort((left, right) => left - right);
@@ -202,6 +206,7 @@ function initialTimeline(snapshot: GameSnapshot, startedAt = 0): PrintTimeline {
       ruleRows: rows,
       ruleCells,
       affectedNouns,
+      transition,
     }],
     trace: ["forme seated / pins aligned", `${snapshot.rules.clauses.length} rules under pressure`],
   };
@@ -209,11 +214,14 @@ function initialTimeline(snapshot: GameSnapshot, startedAt = 0): PrintTimeline {
 
 /** Event-to-animation policy exported for deterministic presentation tests. */
 export function timelineForResult(result: TurnResult, now: number): PrintTimeline {
-  if (result.events.some((event) => event.type === "level-change" || event.type === "restart")) {
-    return initialTimeline(result.snapshot, now);
+  if (result.events.some((event) => event.type === "level-change")) {
+    return initialTimeline(result.snapshot, now, "stage-change");
+  }
+  if (result.events.some((event) => event.type === "restart")) {
+    return initialTimeline(result.snapshot, now, "restart");
   }
   if (result.events.some((event) => event.type === "undo")) {
-    const restored = initialTimeline(result.snapshot, now);
+    const restored = initialTimeline(result.snapshot, now, "undo");
     return {
       ...restored,
       trace: ["carriage returned / proof restored"],

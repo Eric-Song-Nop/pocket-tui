@@ -1,4 +1,5 @@
 import type {
+  Direction,
   Entity,
   GameEvent,
   GameSnapshot,
@@ -36,6 +37,7 @@ export type PrintEffectKind =
   | "calibrate"
   | "transform"
   | "win";
+export type PrintTransitionKind = "initial-load" | "undo" | "restart" | "stage-change";
 
 export type Point = EnginePoint;
 
@@ -133,13 +135,15 @@ export interface PrintCue {
   readonly from?: Readonly<Point>;
   readonly to?: Readonly<Point>;
   readonly entityId?: string;
-  readonly direction?: string;
+  readonly direction?: Direction;
   readonly ruleRows?: readonly number[];
   /** Exact type cells taking part in a changed clause, in reading order. */
   readonly ruleCells?: readonly Readonly<Point>[];
   /** Object nouns whose live behavior changed with the calibrated clause. */
   readonly affectedNouns?: readonly string[];
   readonly affectedEntityIds?: readonly string[];
+  /** Lifecycle meaning for calibration cues; never inferred from display copy. */
+  readonly transition?: PrintTransitionKind;
 }
 
 export interface PrintTimeline {
@@ -169,6 +173,9 @@ export interface PresentationEffectSignal {
   readonly startedAt: number | null;
   readonly durationMs: number;
   readonly progress: number;
+  /** Semantic motion retained even when overlapping cues delay publication. */
+  readonly direction?: Direction;
+  readonly transition?: PrintTransitionKind;
 }
 
 export interface PresentationDiagnostics {
@@ -1093,7 +1100,19 @@ function selectEffectSignal(
     startedAt: selected.startsAt,
     durationMs: selected.durationMs,
     progress: selected.progress,
+    direction: printCueDirection(selected),
+    transition: selected.transition,
   };
+}
+
+function printCueDirection(cue: PrintCue): Direction | undefined {
+  if (cue.direction !== undefined) return cue.direction;
+  if (cue.from === undefined || cue.to === undefined) return undefined;
+  const dx = cue.to.x - cue.from.x;
+  const dy = cue.to.y - cue.from.y;
+  if (Math.abs(dx) > Math.abs(dy)) return dx > 0 ? "right" : "left";
+  if (dy !== 0) return dy > 0 ? "down" : "up";
+  return undefined;
 }
 
 function focusEntity(snapshot: RuleSnapshotLike): RuleEntityLike | undefined {

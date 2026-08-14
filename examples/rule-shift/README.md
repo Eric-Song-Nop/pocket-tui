@@ -6,14 +6,15 @@ properties are physical word blocks. Push them into valid sentences to change
 which objects you control, which objects stop or push, and what completes the
 stage.
 
-The portable ANSI16 presentation is the complete game. Ghostty adds optional
-truecolor letterpress bloom and semantic effects, but no rule, control, panel,
+The portable ANSI16 presentation is the complete game. Ghostty 1.3+ adds an
+optional per-pixel letterpress post-process, but no rule, control, panel,
 animation cue, or piece of information depends on a shader.
 
 ## Preview
 
 These images are rendered from the real retained PocketJS `CanvasFrame`, not a
-separate mock UI:
+separate mock UI. They show the portable renderer, not the optional Ghostty
+shader; launch `bun run ghostty` to see its per-pixel effects.
 
 ![Portable movement, push, transform, and calibration animation](previews/animation-demo.gif)
 
@@ -45,6 +46,26 @@ bun run ghostty
 
 The launcher changes no global Ghostty configuration. Its typed effect-bus
 contract and precise cleanup behavior are documented in [`GHOSTTY.md`](GHOSTTY.md).
+
+## Ghostty's Syntax Loom
+
+The portable 30 FPS particles are terminal cells. Syntax Loom is deliberately
+different: it samples the final Ghostty surface between cells and operates at
+pixel resolution. Movement leaves a sub-pixel RGB registration trail; pushes
+compress and refract the framebuffer; blocked moves fracture into procedural
+type-metal cracks and a surface-edge pulse. Calibration runs a full-width
+proofing roller (reversed for undo), rule changes weave a chromatic moire
+through the active sentence, and victory sends a refractive rectangular proof
+wave through the entire window with a halftone paper wash.
+
+These effects share the game's restrained ink, paper, vermilion, cyan, and
+brass language instead of adding an unrelated CRT filter. The source glyphs
+remain underneath the post-process, their alpha is preserved, and additive
+light is strongly reduced over detected ink. The animated full-surface shader
+does cost more GPU time and power on large or high-density windows; use `bun
+run start` for the complete shader-free game. The implementation, exact
+palette-packet layout, and manual configuration are in
+[`GHOSTTY.md`](GHOSTTY.md).
 
 ## Controls
 
@@ -118,8 +139,9 @@ The demo exercises:
   wide/compact layouts, an active-rule proof, and a move trace.
 - Portable 30 FPS particles for movement, pushing, blocked impacts, rule
   calibration, noun transformation, and victory. They are ordinary retained
-  PocketJS cells and remain fully visible without Ghostty; the optional shader
-  only adds a post-process layer.
+  PocketJS cells and remain fully visible without Ghostty. Syntax Loom adds
+  pixel-scale registration, refraction, moire, procedural cracks, and
+  full-surface proof waves that a cell renderer cannot express.
 - Stable retained node pools: 160 bed, 128 effect, 64 entity, and 96 panel
   runs. Updating or resizing a stage mutates these 448 text/style slots rather
   than remounting the component tree; overflow is shown as `HOST DROP` instead
