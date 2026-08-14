@@ -100,6 +100,8 @@ export class PocketTuiHost {
   readonly #colorMode: PocketTuiColorMode;
   readonly #slots: ArenaSlot[] = [{ generation: 0 }, { generation: 0 }];
   readonly #freeSlots: number[] = [];
+  readonly #workListeners = new Set<() => void>();
+  readonly #inputReadyDisposers = new Set<() => void>();
   readonly #stats: MutableDiagnostics = {
     liveNodes: 1,
     mutations: 0,
@@ -120,6 +122,8 @@ export class PocketTuiHost {
   #nextAnimation = 1;
   #viewport: TuiViewportSize;
   #dirty = true;
+  #surfacePending = false;
+  #surfaceRevision = 0;
   #closed = false;
   #lastLayout?: LayoutResult;
   #lastPaintOrder: readonly number[] = [];
@@ -172,6 +176,73 @@ export class PocketTuiHost {
     return this.#lastFrame;
   }
 
+  /** Whether retained scene mutations still need layout and raster work. */
+  get renderPending(): boolean {
+    return this.#dirty;
+  }
+
+  /** Whether commands submitted to the surface still need an explicit flush. */
+  get surfacePending(): boolean {
+    return this.#surfacePending;
+  }
+
+  /** Whether adaptive sessions can sleep without a JavaScript polling timer. */
+  get inputReadySupported(): boolean {
+    if (this.#surface.onInputReady === undefined) return false;
+    return this.#surface.inputReadySupported?.() ?? true;
+  }
+
+  /**
+   * Subscribe to retained render work or unflushed surface work. A listener
+   * attached while work is already pending is invoked immediately.
+   */
+  onWorkNeeded(listener: () => void): () => void {
+    this.#assertOpen();
+    if (typeof listener !== "function") throw new TypeError("PocketTUI: work listener must be a function");
+    const registration = (): void => listener();
+    this.#workListeners.add(registration);
+    try {
+      if (this.#dirty || this.#surfacePending) registration();
+    } catch (error) {
+      this.#workListeners.delete(registration);
+      throw error;
+    }
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.#workListeners.delete(registration);
+    };
+  }
+
+  /** @deprecated Prefer onWorkNeeded(), which also describes surface work. */
+  onRenderNeeded(listener: () => void): () => void {
+    return this.onWorkNeeded(listener);
+  }
+
+  /** Forward native readiness notifications when the attached surface supports them. */
+  onInputReady(listener: () => void): () => void {
+    this.#assertOpen();
+    if (typeof listener !== "function") {
+      throw new TypeError("PocketTUI: input readiness listener must be a function");
+    }
+    const subscribe = this.#surface.onInputReady;
+    if (subscribe === undefined) return () => {};
+
+    let active = true;
+    const surfaceDispose = subscribe.call(this.#surface, () => {
+      if (active && !this.#closed) listener();
+    });
+    const dispose = (): void => {
+      if (!active) return;
+      active = false;
+      this.#inputReadyDisposers.delete(dispose);
+      surfaceDispose();
+    };
+    this.#inputReadyDisposers.add(dispose);
+    return dispose;
+  }
+
   viewportSize(): TuiViewportSize {
     return Object.freeze({ ...this.#viewport });
   }
@@ -203,6 +274,7 @@ export class PocketTuiHost {
 
   setCursor(options: CursorPacketOptions): void {
     this.#assertOpen();
+    this.#markSurfaceMutation();
     this.#surface.setCursor(options);
   }
 
@@ -211,6 +283,7 @@ export class PocketTuiHost {
     if (this.#surface.setEffectBus === undefined) {
       throw new Error("PocketTUI: the attached surface does not support an effect bus");
     }
+    this.#markSurfaceMutation();
     this.#surface.setEffectBus(frame);
   }
 
@@ -219,6 +292,7 @@ export class PocketTuiHost {
     if (this.#surface.clearEffectBus === undefined) {
       throw new Error("PocketTUI: the attached surface does not support an effect bus");
     }
+    this.#markSurfaceMutation();
     this.#surface.clearEffectBus();
   }
 
@@ -247,13 +321,20 @@ export class PocketTuiHost {
       this.#viewport.rows,
       this.#colorMode,
     );
-    this.#surface.present(raster.frame);
+    const notifySurfaceWork = this.#setSurfacePending();
+    try {
+      this.#surface.present(raster.frame);
+    } catch (error) {
+      if (notifySurfaceWork) this.#notifyWorkNeeded();
+      throw error;
+    }
     this.#lastLayout = layout;
     this.#lastPaintOrder = raster.paintOrder;
     this.#lastFrame = raster.frame;
     this.#dirty = false;
     this.#stats.renderedFrames += 1;
     this.#stats.lastRunCount = raster.frame.runs.length;
+    if (notifySurfaceWork) this.#notifyWorkNeeded();
     return raster.frame;
   }
 
@@ -269,13 +350,31 @@ export class PocketTuiHost {
 
   async flush(mode: FlushMode = "terminal"): Promise<void> {
     this.#assertOpen();
+    const revision = this.#surfaceRevision;
     await this.#surface.flush(mode);
+    if (revision === this.#surfaceRevision) this.#surfacePending = false;
   }
 
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
-    await this.#surface.close();
+    this.#workListeners.clear();
+    const inputReadyDisposers = [...this.#inputReadyDisposers];
+    this.#inputReadyDisposers.clear();
+    let failure: unknown;
+    for (const dispose of inputReadyDisposers) {
+      try {
+        dispose();
+      } catch (error) {
+        failure ??= error;
+      }
+    }
+    try {
+      await this.#surface.close();
+    } catch (error) {
+      failure ??= error;
+    }
+    if (failure !== undefined) throw failure;
   }
 
   snapshot(): readonly PocketTuiNodeSnapshot[] {
@@ -611,8 +710,25 @@ export class PocketTuiHost {
   }
 
   #markMutation(): void {
+    const wasDirty = this.#dirty;
     this.#dirty = true;
     this.#stats.mutations += 1;
+    if (!wasDirty) this.#notifyWorkNeeded();
+  }
+
+  #markSurfaceMutation(): void {
+    if (this.#setSurfacePending()) this.#notifyWorkNeeded();
+  }
+
+  #setSurfacePending(): boolean {
+    const shouldNotify = !this.#surfacePending;
+    this.#surfacePending = true;
+    this.#surfaceRevision += 1;
+    return shouldNotify;
+  }
+
+  #notifyWorkNeeded(): void {
+    for (const listener of [...this.#workListeners]) listener();
   }
 
   #assertOpen(): void {

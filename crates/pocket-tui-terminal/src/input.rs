@@ -338,7 +338,22 @@ impl TerminalInput {
     /// Read until `EAGAIN` and return every complete typed event. This method
     /// cannot block because `open` installs `O_NONBLOCK`.
     pub fn read_available(&mut self) -> Result<Vec<InputEvent>, InputError> {
+        self.read_available_at(Instant::now())
+    }
+
+    fn read_available_at(&mut self, now: Instant) -> Result<Vec<InputEvent>, InputError> {
         let mut events = Vec::new();
+        // Preserve the ambiguity contract even if the owner thread was delayed:
+        // bytes that arrived after an expired standalone Escape must not be
+        // retroactively combined with it into a CSI or Alt sequence.
+        if self
+            .escape_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= ESCAPE_TIMEOUT)
+        {
+            events.extend(self.parser.flush_escape());
+            self.escape_since = None;
+        }
+
         let mut buffer = [0u8; 8192];
         loop {
             // SAFETY: `buffer` is valid writable storage and this object keeps
@@ -362,15 +377,18 @@ impl TerminalInput {
         }
 
         if self.parser.has_incomplete_escape() {
-            let since = self.escape_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= ESCAPE_TIMEOUT {
-                events.extend(self.parser.flush_escape());
-                self.escape_since = None;
-            }
+            self.escape_since.get_or_insert(now);
         } else {
             self.escape_since = None;
         }
         Ok(events)
+    }
+
+    /// Absolute time at which an ambiguous leading Escape should be flushed.
+    #[must_use]
+    pub fn escape_deadline(&self) -> Option<Instant> {
+        self.escape_since
+            .and_then(|since| since.checked_add(ESCAPE_TIMEOUT))
     }
 
     #[must_use]
@@ -501,6 +519,10 @@ fn longest_marker_prefix_suffix(bytes: &[u8], marker: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
     use super::*;
 
     #[test]
@@ -566,6 +588,26 @@ mod tests {
         assert_eq!(
             parser.feed(b"\x96\x1b[201~").unwrap(),
             vec![InputEvent::PasteChunk("世".into()), InputEvent::PasteEnd,]
+        );
+    }
+
+    #[test]
+    fn overdue_escape_is_flushed_before_newly_available_bytes_are_read() {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let mut input = TerminalInput::open(reader.as_raw_fd()).unwrap();
+        let started = Instant::now();
+
+        writer.write_all(b"\x1b").unwrap();
+        assert!(input.read_available_at(started).unwrap().is_empty());
+        let deadline = input.escape_deadline().unwrap();
+
+        writer.write_all(b"[A").unwrap();
+        assert_eq!(
+            input.read_available_at(deadline).unwrap(),
+            vec![
+                key(KeyCode::Escape, KeyModifiers::NONE),
+                InputEvent::Text("[A".into()),
+            ]
         );
     }
 }

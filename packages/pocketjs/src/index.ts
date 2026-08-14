@@ -27,12 +27,15 @@ export {
   type PocketInputHandler,
   type PocketInputMapping,
   type PocketInputMapper,
+  type PocketTuiFramePolicy,
+  type PocketTuiSessionDiagnostics,
   type PocketTuiSessionOptions,
   type PocketTuiStepResult,
 } from "./session.js";
 export { createCoreSurface, type PocketTuiSurface } from "./surface.js";
 export {
   BTN,
+  after,
   batch,
   createComponent,
   createElement,
@@ -47,6 +50,7 @@ export {
   mergeProps,
   onButtonPress,
   onCleanup,
+  onDemandFrame,
   onFrame,
   pushButtonHandlerBlock,
   pushFocusController,
@@ -55,6 +59,7 @@ export {
   release,
   render,
   replaceText,
+  requestFrame,
   retain,
   runSweep,
   setProp,

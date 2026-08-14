@@ -46,9 +46,9 @@ JS retained shadow tree → cell layout → bounded viewport raster
 PocketTUI Canvas → PTX1 → Rust row damage → ANSI terminal transition
 ```
 
-因此 retained demo **RULE//SHIFT** 与 **Signal Below** 都不是游戏代码直接绘制 Canvas。游戏只更新 retained PocketJS view/text nodes；`@pocket-tui/pocketjs` 的内部 surface 才创建 Canvas 并提交 frame。这个 reference backend 在 clean frame 跳过 layout/raster，但 dirty frame 仍会在 JS 对 active tree 做 cell layout、物化有上限的 viewport，并提交完整 semantic Canvas frame；Rust 下游再把实际 terminal 输出限制到 dirty rows。它尚未实现本文规划的 native typed-dirty layout、sparse Canvas patch、零 fixed tick scheduler 或完整 widget/compiler 系统。
+因此 retained demo **RULE//SHIFT** 与 **Signal Below** 都不是游戏代码直接绘制 Canvas。游戏只更新 retained PocketJS view/text nodes；`@pocket-tui/pocketjs` 的内部 surface 才创建 Canvas 并提交 frame。这个 reference backend 在 clean frame 跳过 layout/raster，并已提供由 native input/resize readiness、retained mutation 与 frame lease 驱动的 opt-in adaptive scheduler；dirty frame 仍会在 JS 对 active tree 做 cell layout、物化有上限的 viewport，并提交完整 semantic Canvas frame，Rust 下游再把实际 terminal 输出限制到 dirty rows。它尚未实现本文规划的 native typed-dirty layout、sparse Canvas patch 或完整 widget/compiler 系统。
 
-PocketJS session 当前以 Pocket 虚拟时钟的精确因数频率固定轮询（1/2/3/4/5/6/10/12/15/20/30/60 FPS，默认 30），pump 与 `__simHz` 使用同一数值；terminal key 被建模为 press frame + release frame；pending pulse 上限为 8。实时应用默认使用 latest-direction-wins coalescing，回合制应用可显式选择 bounded ordered direction queue。PocketJS 0.6 renderer 是进程全局状态，因此 adapter 显式限制为每进程一个 active session。颜色默认明确降级为 ANSI16，truecolor 是显式选择；没有主动 capability probe。texture/image/sprite/font atlas/timed animation 等 pixel-oriented 能力都有可观测的占位或 endpoint fallback，而不是宣称完整支持。
+PocketJS session 的 fixed compatibility policy 以 Pocket 虚拟时钟的精确因数频率运行（1/2/3/4/5/6/10/12/15/20/30/60 FPS，默认 30）；adaptive policy 把同一数值作为最大 cadence，在静态时暂停虚拟时钟。terminal key 被建模为 press frame + release frame；pending pulse 上限为 8。实时应用默认使用 latest-direction-wins coalescing，回合制应用可显式选择 bounded ordered direction queue。PocketJS 0.6 renderer 是进程全局状态，因此 adapter 显式限制为每进程一个 active session。颜色默认明确降级为 ANSI16，truecolor 是显式选择；没有主动 capability probe。texture/image/sprite/font atlas/timed animation 等 pixel-oriented 能力都有可观测的占位或 endpoint fallback，而不是宣称完整支持。
 
 当前 backend 的完整能力表、数据所有权与降级语义见 [`docs/pocketjs-backend.md`](pocketjs-backend.md)。后文涉及 compiler、native interaction islands、main/direct surface、完整 probing、virtual document index、image protocol 与 benchmark gate 的部分仍是目标设计。
 

@@ -2,14 +2,20 @@ mod protocol;
 mod runtime_adapter;
 
 use std::sync::Mutex;
+use std::time::Duration;
 
-use napi::bindgen_prelude::Uint8Array;
+use napi::bindgen_prelude::{Function, Uint8Array};
+use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 use napi::{Error, Result, Status};
 use napi_derive::napi;
 use pocket_tui_core::Size;
-use pocket_tui_terminal::{InputEvent, KeyCode, KeyModifiers};
+use pocket_tui_terminal::{
+    InputEvent, InputReadinessArm, InputReadinessWatcher, KeyCode, KeyModifiers,
+};
 
-use runtime_adapter::{MemoryStatsSnapshot, RuntimeAdapter};
+use runtime_adapter::{InputReadinessState, MemoryStatsSnapshot, RuntimeAdapter};
+
+const RESIZE_HEARTBEAT: Duration = Duration::from_millis(250);
 
 /// Native-owned memory and retained-history counters. Number-valued fields use
 /// JavaScript doubles because these are telemetry rather than opaque IDs.
@@ -56,6 +62,7 @@ pub fn native_version() -> &'static str {
 #[napi]
 pub struct NativeTui {
     runtime: Mutex<RuntimeAdapter>,
+    input_ready: Mutex<Option<InputReadinessWatcher>>,
 }
 
 #[napi]
@@ -65,6 +72,7 @@ impl NativeTui {
     pub fn new() -> Self {
         Self {
             runtime: Mutex::new(RuntimeAdapter::default()),
+            input_ready: Mutex::new(None),
         }
     }
 
@@ -90,8 +98,61 @@ impl NativeTui {
     /// Drain terminal input without blocking the JavaScript event loop.
     #[napi]
     pub fn poll_input(&self) -> Result<Vec<NativeInputEvent>> {
-        self.with_runtime(RuntimeAdapter::poll_input)
-            .map(|events| events.into_iter().map(NativeInputEvent::from).collect())
+        let (events, readiness) = self.with_runtime(|runtime| {
+            let events = runtime.poll_input()?;
+            let readiness = runtime.input_readiness_state()?;
+            Ok((events, readiness))
+        })?;
+        self.rearm_input_ready(readiness)?;
+        Ok(events.into_iter().map(NativeInputEvent::from).collect())
+    }
+
+    /// Register a long-lived, one-shot terminal input readiness callback.
+    /// Every `poll_input` call automatically rearms it after draining input.
+    #[napi]
+    pub fn on_input_ready(&self, callback: Function<'_, (), ()>) -> Result<()> {
+        let threadsafe = callback
+            .build_threadsafe_function::<()>()
+            .max_queue_size::<1>()
+            .build()?;
+        let readiness = self
+            .with_runtime(|runtime| runtime.input_readiness_state())?
+            .ok_or_else(|| {
+                Error::new(
+                    Status::GenericFailure,
+                    "start the native terminal session before registering input readiness",
+                )
+            })?;
+
+        self.stop_input_ready()?;
+        let watcher = InputReadinessWatcher::new(
+            readiness.input_fd,
+            readiness.resize_fd,
+            readiness.viewport,
+            move |_| {
+                let _ = threadsafe.call((), ThreadsafeFunctionCallMode::NonBlocking);
+            },
+        )
+        .map_err(readiness_error)?;
+        watcher
+            .rearm(InputReadinessArm {
+                escape_deadline: readiness.escape_deadline,
+                resize_heartbeat: Some(RESIZE_HEARTBEAT),
+                confirmed_viewport: Some(readiness.viewport),
+            })
+            .map_err(readiness_error)?;
+        let mut slot = self
+            .input_ready
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "input readiness lock poisoned"))?;
+        *slot = Some(watcher);
+        Ok(())
+    }
+
+    /// Stop input readiness delivery and join its native poll thread.
+    #[napi]
+    pub fn clear_input_ready(&self) -> Result<()> {
+        self.stop_input_ready()
     }
 
     /// Read the latest viewport dimensions directly from the attached tty.
@@ -109,7 +170,10 @@ impl NativeTui {
 
     #[napi]
     pub fn close(&self) -> Result<()> {
-        self.with_runtime(RuntimeAdapter::close)
+        let readiness_result = self.stop_input_ready();
+        let runtime_result = self.with_runtime(RuntimeAdapter::close);
+        readiness_result?;
+        runtime_result
     }
 }
 
@@ -124,10 +188,60 @@ impl NativeTui {
             .map_err(|_| Error::new(Status::GenericFailure, "native runtime lock poisoned"))?;
         operation(&mut runtime).map_err(|message| Error::new(Status::GenericFailure, message))
     }
+
+    fn rearm_input_ready(&self, readiness: Option<InputReadinessState>) -> Result<()> {
+        let slot = self
+            .input_ready
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "input readiness lock poisoned"))?;
+        if let (Some(watcher), Some(readiness)) = (slot.as_ref(), readiness) {
+            watcher
+                .rearm(InputReadinessArm {
+                    escape_deadline: readiness.escape_deadline,
+                    resize_heartbeat: Some(RESIZE_HEARTBEAT),
+                    confirmed_viewport: Some(readiness.viewport),
+                })
+                .map_err(readiness_error)?;
+        }
+        Ok(())
+    }
+
+    fn stop_input_ready(&self) -> Result<()> {
+        let watcher = {
+            let mut slot = self
+                .input_ready
+                .lock()
+                .map_err(|_| Error::new(Status::GenericFailure, "input readiness lock poisoned"))?;
+            slot.take()
+        };
+        watcher
+            .map(InputReadinessWatcher::shutdown)
+            .transpose()
+            .map(|_| ())
+            .map_err(readiness_error)
+    }
+}
+
+impl Drop for NativeTui {
+    fn drop(&mut self) {
+        let slot = match self.input_ready.get_mut() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(watcher) = slot.take() {
+            let _ = watcher.shutdown();
+        }
+        // RuntimeAdapter drops after this body, so tty restore cannot race the
+        // poll thread or a borrowed input descriptor.
+    }
 }
 
 fn invalid_arg(error: impl std::fmt::Display) -> Error {
     Error::new(Status::InvalidArg, error.to_string())
+}
+
+fn readiness_error(error: impl std::fmt::Display) -> Error {
+    Error::new(Status::GenericFailure, error.to_string())
 }
 
 impl From<MemoryStatsSnapshot> for NativeMemoryStats {

@@ -11,7 +11,14 @@
 // npm package publishes TypeScript source, so this adapter's executable runtime
 // is Bun; Node is not advertised until that upstream artifact can be bundled.
 import { mount as mountPocketJs, resetPack } from "@pocketjs/framework";
-import { createRenderEffect, createRoot } from "solid-js/dist/solid.js";
+import {
+  createRenderEffect,
+  createRoot,
+  createSignal as createClientSignal,
+  onCleanup,
+} from "solid-js/dist/solid.js";
+import { onFrame as registerPocketFrame } from "@pocketjs/framework/lifecycle";
+import { after as schedulePocketAfter } from "@pocketjs/framework/clock";
 import {
   resetRendererState,
   resetSprites,
@@ -45,12 +52,6 @@ export {
 } from "@pocketjs/framework/input";
 export { simulationHz, virtualNow } from "@pocketjs/framework/clock";
 export {
-  createSpriteAnimation,
-  onButtonPress,
-  onFrame,
-  pushButtonHandlerBlock,
-} from "@pocketjs/framework/lifecycle";
-export {
   createElement,
   createTextNode,
   insertNode,
@@ -63,6 +64,111 @@ export {
 } from "@pocketjs/framework/solid/renderer";
 
 export const effect = createRenderEffect;
+
+let requestedFrame = false;
+let frameWake;
+const continuousFrameLeases = new Set();
+const demandFrames = new Set();
+const clientFrameCallbacks = new Set();
+let frameBridgeInstalled = false;
+const buttonHandlerBlocks = new Set();
+
+export function onFrame(callback) {
+  acquireContinuousFrame();
+  registerClientFrame(callback);
+}
+
+export function onButtonPress(mask, callback, options = {}) {
+  let previousButtons = options.latched ? ~0 : 0;
+  registerClientFrame((buttons) => {
+    const pressed = buttons & ~previousButtons;
+    previousButtons = buttons;
+    const active =
+      typeof options.active === "function" ? options.active() : (options.active ?? true);
+    if (!active) return;
+    if (buttonHandlerBlocks.size > 0 && !options.allowWhenBlocked) return;
+    if (pressed & mask) callback(pressed, buttons);
+  });
+}
+
+export function pushButtonHandlerBlock() {
+  const block = Symbol("PocketJS button handler block");
+  buttonHandlerBlocks.add(block);
+  return () => {
+    buttonHandlerBlocks.delete(block);
+  };
+}
+
+export function after(seconds, callback) {
+  const release = acquireContinuousFrame(false);
+  let active = true;
+  let cancel;
+  try {
+    cancel = schedulePocketAfter(seconds, () => {
+      if (!active) return;
+      active = false;
+      release();
+      callback();
+    });
+  } catch (error) {
+    active = false;
+    release();
+    throw error;
+  }
+  return () => {
+    if (!active) return;
+    active = false;
+    try {
+      cancel();
+    } finally {
+      release();
+    }
+  };
+}
+
+export function createSpriteAnimation(frames, options) {
+  if (frames.length === 0) {
+    throw new Error("PocketJS: createSpriteAnimation() requires at least one frame");
+  }
+  const frameStep = Math.max(1, Math.floor(options?.frameStep ?? 1));
+  const [frame, setFrame] = createClientSignal(0);
+  onFrame(() => {
+    setFrame((current) => (current + 1) % (frames.length * frameStep));
+  });
+  return () => frames[Math.floor(frame() / frameStep) % frames.length];
+}
+
+export function onDemandFrame(callback) {
+  const demand = { next: true };
+  demandFrames.add(demand);
+  registerClientFrame((buttons) => {
+    demand.next = callback(buttons) === true;
+  });
+  onCleanup(() => demandFrames.delete(demand));
+  notifyFrameWake();
+}
+
+export function requestFrame() {
+  requestedFrame = true;
+  notifyFrameWake();
+}
+
+export function __hasFrameWork() {
+  if (continuousFrameLeases.size > 0 || requestedFrame) return true;
+  for (const demand of demandFrames) {
+    if (demand.next) return true;
+  }
+  return false;
+}
+
+export function __consumeFrameRequest() {
+  requestedFrame = false;
+}
+
+export function __setFrameWake(callback) {
+  frameWake = callback;
+  if (callback && __hasFrameWork()) callback();
+}
 
 export function mount(code, options = {}) {
   resetPocketRuntimeState();
@@ -110,9 +216,43 @@ export function mount(code, options = {}) {
 }
 
 function resetPocketRuntimeState() {
+  continuousFrameLeases.clear();
+  requestedFrame = false;
+  demandFrames.clear();
+  clientFrameCallbacks.clear();
+  frameBridgeInstalled = false;
+  buttonHandlerBlocks.clear();
+  frameWake = undefined;
   resetRendererState();
   resetTextures();
   resetSprites();
   resetPack();
   resetStyles();
+}
+
+function acquireContinuousFrame(lifecycleScoped = true) {
+  const lease = Symbol("PocketTUI continuous frame lease");
+  continuousFrameLeases.add(lease);
+  const release = () => {
+    continuousFrameLeases.delete(lease);
+  };
+  if (lifecycleScoped) onCleanup(release);
+  notifyFrameWake();
+  return release;
+}
+
+function registerClientFrame(callback) {
+  if (!frameBridgeInstalled) {
+    registerPocketFrame((buttons) => {
+      for (const frameCallback of [...clientFrameCallbacks]) frameCallback(buttons);
+    });
+    frameBridgeInstalled = true;
+  }
+  const registration = (buttons) => callback(buttons);
+  clientFrameCallbacks.add(registration);
+  onCleanup(() => clientFrameCallbacks.delete(registration));
+}
+
+function notifyFrameWake() {
+  frameWake?.();
 }

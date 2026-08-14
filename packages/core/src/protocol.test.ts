@@ -177,4 +177,197 @@ describe("canvas PTX records", () => {
     const plain = createTui({ nativeBinding });
     expect(() => plain.setEffectBus({ trigger: true })).toThrow("effectBus");
   });
+
+  test("explicit flush invalidates its queued microtask without suppressing later mutations", async () => {
+    const submitted: Uint8Array[] = [];
+    let flushes = 0;
+    class CapturingNative {
+      submit(packet: Uint8Array): string {
+        submitted.push(packet.slice());
+        return decodePtx(packet).sequence.toString();
+      }
+      start(): void {}
+      flush(): void {
+        flushes += 1;
+      }
+      close(): void {}
+      pollInput(): never[] {
+        return [];
+      }
+      memoryStats(): Record<string, number> {
+        return {};
+      }
+    }
+    const app = createTui({
+      nativeBinding: { NativeTui: CapturingNative, nativeVersion: () => "test" } as never,
+    });
+    const text = app.text("zero");
+    app.mount(text);
+    await app.start();
+
+    text.setText("one");
+    const explicitFlush = app.flush();
+    text.setText("two");
+    await explicitFlush;
+    await Promise.resolve();
+
+    expect(flushes).toBe(2);
+    expect(
+      submitted.flatMap((packet) => decodePtx(packet).operations).filter((operation) =>
+        operation.opcode === PtxOpcode.SetText,
+      ),
+    ).toHaveLength(2);
+    await app.close();
+  });
+
+  test("automatic flush errors remain observable and close still finalizes the app", async () => {
+    let failNextFlush = true;
+    let closes = 0;
+    class FailingNative {
+      submit(packet: Uint8Array): string {
+        return decodePtx(packet).sequence.toString();
+      }
+      start(): void {}
+      flush(): void {
+        if (failNextFlush) {
+          failNextFlush = false;
+          throw new Error("automatic flush failed");
+        }
+      }
+      close(): void {
+        closes += 1;
+      }
+      pollInput(): never[] {
+        return [];
+      }
+      memoryStats(): Record<string, number> {
+        return {};
+      }
+    }
+    const app = createTui({
+      nativeBinding: { NativeTui: FailingNative, nativeVersion: () => "test" } as never,
+    });
+    const text = app.text("zero");
+    app.mount(text);
+    await app.start();
+
+    text.setText("one");
+    await Promise.resolve();
+    expect(() => app.pollInput()).toThrow("automatic flush failed");
+    expect(app.pollInput()).toEqual([]);
+
+    await app.close();
+    expect(app.state).toBe("closed");
+    expect(closes).toBe(1);
+  });
+
+  test("native close errors still finalize app state and discard queued commands", async () => {
+    let flushes = 0;
+    class FailingCloseNative {
+      submit(packet: Uint8Array): string {
+        return decodePtx(packet).sequence.toString();
+      }
+      start(): void {}
+      flush(): void {
+        flushes += 1;
+      }
+      close(): void {
+        throw new Error("native close failed");
+      }
+      pollInput(): never[] {
+        return [];
+      }
+      memoryStats(): Record<string, number> {
+        return {};
+      }
+    }
+    const app = createTui({
+      nativeBinding: { NativeTui: FailingCloseNative, nativeVersion: () => "test" } as never,
+    });
+    const text = app.text("zero");
+    app.mount(text);
+    await app.start();
+    text.setText("queued");
+
+    await expect(app.close()).rejects.toThrow("native close failed");
+    expect(app.state).toBe("closed");
+    expect(flushes).toBe(1);
+    await Promise.resolve();
+    expect(flushes).toBe(1);
+    await app.close();
+  });
+
+  test("coalesces native readiness behind disposable app listeners", async () => {
+    let ready: (() => void) | undefined;
+    let installs = 0;
+    let clears = 0;
+    let closes = 0;
+    class ReadyNative {
+      submit(packet: Uint8Array): string {
+        return decodePtx(packet).sequence.toString();
+      }
+      start(): void {}
+      flush(): void {}
+      close(): void {
+        closes += 1;
+      }
+      pollInput(): never[] {
+        return [];
+      }
+      onInputReady(callback: () => void): void {
+        installs += 1;
+        ready = callback;
+      }
+      clearInputReady(): void {
+        clears += 1;
+        ready = undefined;
+      }
+      memoryStats(): Record<string, number> {
+        return {};
+      }
+    }
+
+    const app = createTui({
+      nativeBinding: { NativeTui: ReadyNative, nativeVersion: () => "test" } as never,
+    });
+    app.mount(app.text("ready"));
+    let first = 0;
+    let second = 0;
+    const releaseFirst = app.onInputReady(() => {
+      first += 1;
+    });
+    const releaseSecond = app.onInputReady(() => {
+      second += 1;
+    });
+    expect(installs).toBe(0);
+
+    await app.start();
+    expect(installs).toBe(1);
+    ready?.();
+    expect([first, second]).toEqual([1, 1]);
+
+    releaseFirst();
+    ready?.();
+    expect([first, second]).toEqual([1, 2]);
+    expect(clears).toBe(0);
+
+    const staleReady = ready;
+    releaseSecond();
+    expect(clears).toBe(1);
+    const releaseThrowing = app.onInputReady(() => {
+      throw new Error("readiness listener failed");
+    });
+    expect(installs).toBe(2);
+    const currentReady = ready;
+    staleReady?.();
+    expect(app.pollInput()).toEqual([]);
+    currentReady?.();
+    expect(() => app.pollInput()).toThrow("readiness listener failed");
+    expect(app.pollInput()).toEqual([]);
+    releaseThrowing();
+
+    await app.close();
+    expect(clears).toBe(2);
+    expect(closes).toBe(1);
+  });
 });

@@ -3,6 +3,7 @@
 use std::io::{self, Write};
 use std::os::fd::RawFd;
 use std::sync::Arc;
+use std::time::Instant;
 
 use pocket_tui_core::Color;
 use pocket_tui_core::FrameArtifact;
@@ -360,6 +361,14 @@ impl TerminalSession<FdWriter> {
         self.input
             .as_ref()
             .map(TerminalInput::input_fd)
+            .ok_or(TerminalError::InputUnavailable)
+    }
+
+    /// Parser-owned deadline for resolving a standalone Escape key.
+    pub fn input_escape_deadline(&self) -> Result<Option<Instant>, TerminalError> {
+        self.input
+            .as_ref()
+            .map(TerminalInput::escape_deadline)
             .ok_or(TerminalError::InputUnavailable)
     }
 }
