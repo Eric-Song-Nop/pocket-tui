@@ -216,7 +216,155 @@ describe("RULE//SHIFT PocketJS backend integration", () => {
     expect(isImmediateQuit({ kind: "text", text: "ddddq" })).toBe(true);
     expect(isImmediateQuit({ kind: "key", key: "c", ctrl: true })).toBe(true);
   });
+
+  test("renders movement and rule transformation as multi-frame portable particles", async () => {
+    const movement = await recordAnimation("freight", "d", 7);
+    const beforePlayer = movement.before.cells.find((cell) => cell.id === "entity-freight-player");
+    const afterPlayer = movement.after.cells.find((cell) => cell.id === "entity-freight-player");
+    expect(beforePlayer).toBeDefined();
+    expect(afterPlayer).toBeDefined();
+    expect({ column: afterPlayer?.column, row: afterPlayer?.row }).not.toEqual({
+      column: beforePlayer?.column,
+      row: beforePlayer?.row,
+    });
+
+    // These are frames returned by the real PocketJS host, not direct
+    // present() samples. Movement must read as motion without Ghostty shaders.
+    expect(hasAnimatedTriple(movement.frames)).toBe(true);
+    expect(distinct(movement.frames.flatMap((frame) => frame.effects.positions))).toBeGreaterThan(1);
+    expect(distinct(movement.frames.flatMap((frame) => frame.effects.glyphs))).toBeGreaterThan(1);
+    expect(distinct(movement.frames.flatMap((frame) => frame.effects.colors))).toBeGreaterThan(1);
+    expect(distinct(movement.frames.map((frame) => frame.effects.runCount))).toBeGreaterThan(1);
+    const movementPeak = Math.max(...movement.frames.map((frame) => frame.effects.cellCount));
+    expect(movementPeak).toBeGreaterThanOrEqual(2);
+    expect(movement.retainedStable).toBe(true);
+
+    // `a` queues behind `w`; once it executes, the first turn's larger
+    // transform/calibration particle set must still be present instead of
+    // being replaced by the second move timeline.
+    const transformation = await recordAnimation("bloom", "wa", 22);
+    expect(transformation.snapshot.turn).toBe(2);
+    expect(transformation.snapshot.entities.find((entity) => entity.id === "bloom-player"))
+      .toMatchObject({ kind: "object", noun: "BLOOM" });
+    expect(transformation.frames.some((frame) =>
+      frame.turn >= 2 &&
+      (frame.effectKind === "transform" || frame.effectKind === "calibrate") &&
+      frame.effects.cellCount > 0
+    )).toBe(true);
+    expect(Math.max(...transformation.frames.map((frame) => frame.effects.cellCount)))
+      .toBeGreaterThan(movementPeak);
+    expect(Math.max(...transformation.frames.map((frame) => frame.effects.runCount)))
+      .toBeGreaterThan(1);
+    expect(distinct(transformation.frames.map((frame) => frame.effects.signature)))
+      .toBeGreaterThan(4);
+    expect(transformation.retainedStable).toBe(true);
+  });
 });
+
+async function recordAnimation(startLevel: string, input: string, frameCount: number) {
+  const surface = new DemoSurface();
+  const host = createPocketTuiHost({ surface, colorMode: "truecolor" });
+  let session: PocketTuiSession | undefined;
+  let latestScene: PresentationScene | undefined;
+  let latestSnapshot: GameSnapshot | undefined;
+  const context: RuleShiftContext = {
+    viewport: () => surface.size,
+    diagnostics: () => ({
+      liveNodes: host.diagnostics.liveNodes,
+      operations: host.diagnostics.mutations,
+      frameGeneration: host.diagnostics.renderedFrames,
+    }),
+    present: (scene, snapshot) => {
+      latestScene = scene;
+      latestSnapshot = snapshot;
+    },
+    requestClose: () => session?.requestClose(),
+  };
+
+  session = await mountPocketTui(() => RuleShift({ context, startLevel }), {
+    host,
+    fps: RULE_SHIFT_FPS,
+    directionPulsePolicy: "queue",
+    mapInput: ruleShiftInputMap,
+  });
+  try {
+    await Promise.resolve();
+    await session.step();
+    await stepMany(session, 24);
+    if (latestScene === undefined || latestSnapshot === undefined) {
+      throw new Error("RULE//SHIFT did not publish its initial retained scene");
+    }
+    expect(latestScene.effectSignal.kind).toBe("idle");
+    const before = latestScene;
+    const nodeIds = host.snapshot().map((node) => node.id).join(",");
+    const liveNodes = host.diagnostics.liveNodes;
+    let retainedStable = true;
+    const frames = [];
+    surface.inputs.push({ kind: "text", text: input });
+    for (let index = 0; index < frameCount; index += 1) {
+      const { frame } = await session.step();
+      if (latestScene === undefined || latestSnapshot === undefined) break;
+      frames.push({
+        effects: portableEffectSample(frame, latestScene),
+        effectKind: latestScene.effectSignal.kind,
+        turn: latestSnapshot.turn,
+      });
+      retainedStable &&= host.diagnostics.liveNodes === liveNodes &&
+        host.snapshot().map((node) => node.id).join(",") === nodeIds;
+    }
+    return {
+      before,
+      after: latestScene,
+      snapshot: latestSnapshot,
+      frames,
+      retainedStable,
+    };
+  } finally {
+    await session.close();
+  }
+}
+
+function portableEffectSample(frame: CanvasFrame, scene: PresentationScene) {
+  const raster = new Map<string, { glyph: string; color: string; run: number }>();
+  frame.runs.forEach((run, runIndex) => {
+    [...run.text].forEach((glyph, offset) => raster.set(`${run.row}:${run.column + offset}`, {
+      glyph,
+      color: JSON.stringify(run.style?.foreground ?? null),
+      run: runIndex,
+    }));
+  });
+  const visible = new Map<string, { position: string; glyph: string; color: string; run: number }>();
+  for (const cell of scene.cells) {
+    if (cell.layer !== "effect") continue;
+    for (const [offset, expectedGlyph] of [...cell.text].entries()) {
+      const position = `${cell.row}:${cell.column + offset}`;
+      const rendered = raster.get(position);
+      if (rendered?.glyph === expectedGlyph) visible.set(position, { position, ...rendered });
+    }
+  }
+  const cells = [...visible.values()].sort((left, right) => left.position.localeCompare(right.position));
+  return {
+    signature: cells.map((cell) => `${cell.position}:${cell.glyph}:${cell.color}`).join("|"),
+    cellCount: cells.length,
+    runCount: distinct(cells.map((cell) => cell.run)),
+    positions: cells.map((cell) => cell.position),
+    glyphs: cells.map((cell) => cell.glyph),
+    colors: cells.map((cell) => cell.color),
+  };
+}
+
+function hasAnimatedTriple(samples: readonly { effects: { signature: string; cellCount: number } }[]): boolean {
+  for (let index = 0; index + 2 < samples.length; index += 1) {
+    const window = samples.slice(index, index + 3);
+    if (window.every((sample) => sample.effects.cellCount > 0) &&
+      distinct(window.map((sample) => sample.effects.signature)) === 3) return true;
+  }
+  return false;
+}
+
+function distinct(values: readonly unknown[]): number {
+  return new Set(values).size;
+}
 
 async function stepMany(session: PocketTuiSession, count: number): Promise<void> {
   for (let index = 0; index < count; index += 1) await session.step();

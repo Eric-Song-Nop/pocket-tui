@@ -15,6 +15,8 @@ animation cue, or piece of information depends on a shader.
 These images are rendered from the real retained PocketJS `CanvasFrame`, not a
 separate mock UI:
 
+![Portable movement, push, transform, and calibration animation](previews/animation-demo.gif)
+
 ![KINDLE opening proof](previews/kindle-wide.png)
 
 ![BLOOM noun transformation](previews/bloom-transform-wide.png)
@@ -111,8 +113,13 @@ The demo exercises:
   `YOU`, `WIN`, `STOP`, `PUSH`, noun transformation, undo, restart, stage
   selection, and explicit semantic events.
 - A pure presentation projection with a six-token ink/lead/paper/vermilion/
-  cyan/brass system, layer-safe cell composition, timelines, wide/compact
-  layouts, an active-rule proof, and a move trace.
+  cyan/brass system, physical multi-row word blocks and object sprites (up to
+  6×3 terminal cells per world tile), layer-safe cell composition, timelines,
+  wide/compact layouts, an active-rule proof, and a move trace.
+- Portable 30 FPS particles for movement, pushing, blocked impacts, rule
+  calibration, noun transformation, and victory. They are ordinary retained
+  PocketJS cells and remain fully visible without Ghostty; the optional shader
+  only adds a post-process layer.
 - Stable retained node pools: 160 bed, 128 effect, 64 entity, and 96 panel
   runs. Updating or resizing a stage mutates these 448 text/style slots rather
   than remounting the component tree; overflow is shown as `HOST DROP` instead

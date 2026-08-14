@@ -50,9 +50,36 @@ describe("movable-type presentation system", () => {
     expect(wide.layout.proof).not.toBeNull();
     expect(wide.projection.width).toBe(snapshot.width);
     expect(compact.projection.width).toBe(snapshot.width);
+    expect(wide.projection.rowPitch).toBe(3);
+    expect(wide.projection.faceHeight).toBe(3);
+    expect(compact.projection.rowPitch).toBeGreaterThan(1);
     expect(wide.layout.board.column + wide.layout.board.width).toBeLessThan(
       wide.layout.proof!.column,
     );
+  });
+
+  test("renders words and objects as unmistakable multi-row type blocks", () => {
+    const scene = present(
+      createRuleGame().snapshot(),
+      EMPTY_TIMELINE,
+      { columns: 108, rows: 38 },
+      0,
+    );
+    expect(scene.projection).toMatchObject({ pitch: 6, faceWidth: 5, rowPitch: 3, faceHeight: 3 });
+
+    const word = entityTile(scene, "kindle-mote");
+    expect(word.map((cell) => cell.row)).toEqual([
+      word[0]!.row,
+      word[0]!.row + 1,
+      word[0]!.row + 2,
+    ]);
+    expect(word.map((cell) => cell.text)).toEqual(["╭───╮", "MOTE ", "╰───╯"]);
+    expect(word.every((cell) => cell.background === "paper")).toBe(true);
+
+    const mote = entityTile(scene, "kindle-player");
+    expect(mote.map((cell) => cell.text)).toEqual(["· ╵ ·", "· ✦ ·", "· ╷ ·"]);
+    expect(new Set(mote.map((cell) => cell.row)).size).toBe(3);
+    expect(mote.every((cell) => cell.text.trim() !== "")).toBe(true);
   });
 
   test("uses a complete word or an explicit sort mark, never a misleading truncation", () => {
@@ -176,13 +203,14 @@ describe("rule composition and stacked faces", () => {
     expect(result.phase).toBe("won");
 
     const scene = present(result.snapshot, EMPTY_TIMELINE, { columns: 110, rows: 30 }, 0);
-    const stack = scene.cells.filter(
-      (cell) => cell.layer === "entity" && cell.world?.x === 4 && cell.world?.y === 4,
+    const stack = scene.cells.filter((cell) =>
+      cell.id === "entity-kindle-player" || cell.id === "entity-kindle-target"
     );
     expect(stack).toHaveLength(2);
     expect(stack.every((cell) => cell.text.trim().length > 0)).toBe(true);
     expect(new Set(stack.map((cell) => cell.column)).size).toBe(2);
-    expect(stack.map((cell) => cell.text.trim()).sort()).toEqual(["◆", "✦"]);
+    expect(stack.map((cell) => cell.text).some((text) => text.includes("◆"))).toBe(true);
+    expect(stack.map((cell) => cell.text).some((text) => text.includes("✦"))).toBe(true);
   });
 
   test("uses an explicit composite proof mark when one-column zoom cannot split a stack", () => {
@@ -198,6 +226,105 @@ describe("rule composition and stacked faces", () => {
 });
 
 describe("print choreography and retained telemetry", () => {
+  test("animates a portable move trail across consecutive 30fps frames", () => {
+    const snapshot = createRuleGame().snapshot();
+    const timeline = schedulePrintTimeline([{
+      type: "move",
+      entityId: "kindle-player",
+      from: { x: 8, y: 3 },
+      to: { x: 7, y: 3 },
+    }], 0);
+    const cue = timeline.cues[0]!;
+    const frames = [0, 1_000 / 30, 2_000 / 30].map((now) =>
+      effectCells(present(snapshot, timeline, { columns: 108, rows: 38 }, now), cue.id)
+    );
+    expect(frames.every((frame) => frame.length >= 4)).toBe(true);
+    expect(new Set(frames.map(effectSignature)).size).toBe(3);
+    expect(new Set(frames.flatMap((frame) => frame.map((cell) => `${cell.column},${cell.row}`))).size).toBeGreaterThan(2);
+    expect(new Set(frames.flatMap((frame) => frame.map((cell) => cell.text))).size).toBeGreaterThan(2);
+    expect(new Set(frames.flatMap((frame) => frame.map((cell) => cell.token))).size).toBeGreaterThan(1);
+  });
+
+  test("gives all six effects deterministic changing CanvasFrame particles", () => {
+    const base = createRuleGame();
+    const snapshot = base.snapshot();
+    const changed = base.move("up");
+    const ruleEvent = changed.events.find((event) => event.type === "rules-changed")!;
+    const cases: readonly {
+      readonly kind: string;
+      readonly event: GameEvent;
+      readonly snapshot: typeof snapshot;
+      readonly token: string;
+      readonly minimum: number;
+    }[] = [
+      {
+        kind: "move",
+        event: { type: "move", entityId: "kindle-player", from: { x: 8, y: 3 }, to: { x: 7, y: 3 } },
+        snapshot,
+        token: "cyan",
+        minimum: 4,
+      },
+      {
+        kind: "push",
+        event: { type: "push", entityId: "kindle-win", from: { x: 8, y: 2 }, to: { x: 8, y: 1 } },
+        snapshot,
+        token: "brass",
+        minimum: 6,
+      },
+      {
+        kind: "blocked",
+        event: {
+          type: "blocked",
+          entityIds: ["kindle-player"],
+          from: [{ x: 8, y: 3 }],
+          cell: { x: 9, y: 3 },
+          direction: "right",
+          reason: "stop",
+        },
+        snapshot,
+        token: "vermilion",
+        minimum: 3,
+      },
+      { kind: "calibrate", event: ruleEvent, snapshot: changed.snapshot, token: "brass", minimum: 6 },
+      {
+        kind: "transform",
+        event: { type: "transform", entityId: "kindle-player", from: "MOTE", to: "BLOOM", at: { x: 8, y: 3 } },
+        snapshot,
+        token: "cyan",
+        minimum: 6,
+      },
+      {
+        kind: "win",
+        event: { type: "win", entityIds: ["kindle-player", "kindle-target"], at: { x: 4, y: 4 }, turn: 7 },
+        snapshot,
+        token: "brass",
+        minimum: 8,
+      },
+    ];
+
+    const counts = new Map<string, number>();
+    for (const candidate of cases) {
+      const timeline = schedulePrintTimeline([candidate.event], 500);
+      const cue = timeline.cues.find((entry) => entry.kind === candidate.kind)!;
+      const frames = [0.12, 0.42, 0.74].map((progress) => effectCells(
+        present(
+          candidate.snapshot,
+          timeline,
+          { columns: 108, rows: 38 },
+          cue.startsAt + cue.durationMs * progress,
+        ),
+        cue.id,
+      ));
+      expect(frames.every((frame) => frame.length >= candidate.minimum)).toBe(true);
+      expect(frames.every((frame) => frame.some((cell) => cell.token === candidate.token))).toBe(true);
+      expect(new Set(frames.map(effectSignature)).size).toBe(3);
+      counts.set(candidate.kind, Math.max(...frames.map((frame) => frame.length)));
+    }
+    expect(counts.get("calibrate")!).toBeGreaterThan(counts.get("move")!);
+    expect(counts.get("transform")!).toBeGreaterThan(counts.get("move")!);
+    expect(counts.get("win")!).toBeGreaterThan(counts.get("move")!);
+  });
+
   test("anchors blocked and calibration cues to actual engine cells", () => {
     const game = createRuleGame();
     const first = game.move("up");
@@ -246,7 +373,7 @@ describe("print choreography and retained telemetry", () => {
 
     const lateNow = calibration!.startsAt + calibration!.durationMs * 0.65;
     const late = present(result.snapshot, timeline, { columns: 108, rows: 38 }, lateNow);
-    expect(late.cells.filter((cell) => cell.id.includes(`${calibration!.id}-rule-`))).toHaveLength(3);
+    expect(late.cells.filter((cell) => /^effect-.*-rule-\d+$/.test(cell.id))).toHaveLength(3);
   });
 
   test("calibrates removed-only rules and an undo-restored proof", () => {
@@ -312,4 +439,21 @@ describe("print choreography and retained telemetry", () => {
 
 function entityCell(scene: ReturnType<typeof present>, entityId: string) {
   return scene.cells.find((cell) => cell.id === `entity-${entityId}`);
+}
+
+function entityTile(scene: ReturnType<typeof present>, entityId: string) {
+  return scene.cells
+    .filter((cell) => cell.id === `entity-${entityId}` || cell.id.startsWith(`entity-${entityId}:face-`))
+    .sort((left, right) => left.row - right.row);
+}
+
+function effectCells(scene: ReturnType<typeof present>, cueId: string) {
+  return scene.cells.filter((cell) => cell.layer === "effect" && cell.id.startsWith(`effect-${cueId}-`));
+}
+
+function effectSignature(cells: ReturnType<typeof effectCells>): string {
+  return cells
+    .map((cell) => `${cell.id}@${cell.column},${cell.row}:${cell.text}:${cell.token}`)
+    .sort()
+    .join("|");
 }

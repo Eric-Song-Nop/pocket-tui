@@ -80,6 +80,10 @@ export function RuleShift(options: RuleShiftOptions): NodeMirror {
   let timeline = initialTimeline(snapshot);
   let visualNow = BOOT_NOW_MS;
   let unlockAt = 0;
+  // Button handlers run earlier than this component's onFrame hook. Hold a
+  // freshly scheduled cue at progress zero for the current host render rather
+  // than immediately skipping its first portable CanvasFrame.
+  let timelineChangedThisFrame = false;
   const pendingActions: QueuedAction[] = [];
   let observedViewport = context.viewport();
 
@@ -125,8 +129,12 @@ export function RuleShift(options: RuleShiftOptions): NodeMirror {
   const perform = (action: QueuedAction): void => {
     const result = game.dispatch(action as GameCommand);
     snapshot = result.snapshot;
-    timeline = timelineForResult(result, visualNow);
+    const nextTimeline = timelineForResult(result, visualNow);
+    timeline = replacesPrintTimeline(result)
+      ? nextTimeline
+      : mergeActivePrintTimelines(timeline, nextTimeline, visualNow);
     unlockAt = visualNow + interactionLock(result);
+    timelineChangedThisFrame = nextTimeline.cues.length > 0;
     setRevision((value) => value + 1);
   };
 
@@ -151,7 +159,10 @@ export function RuleShift(options: RuleShiftOptions): NodeMirror {
     }
 
     const timelineEnd = timeline.startedAt + timeline.durationMs;
-    if (visualNow < timelineEnd || (pendingActions.length > 0 && visualNow < unlockAt)) {
+    if (
+      !timelineChangedThisFrame &&
+      (visualNow < timelineEnd || (pendingActions.length > 0 && visualNow < unlockAt))
+    ) {
       visualNow += FRAME_MS;
       setClock(visualNow);
     }
@@ -159,6 +170,7 @@ export function RuleShift(options: RuleShiftOptions): NodeMirror {
       const action = pendingActions.shift();
       if (action !== undefined) perform(action);
     }
+    timelineChangedThisFrame = false;
   });
 
   effect<PresentationScene | undefined>(() => {
@@ -210,6 +222,37 @@ export function timelineForResult(result: TurnResult, now: number): PrintTimelin
   return schedulePrintTimeline(result.events, now);
 }
 
+function replacesPrintTimeline(result: TurnResult): boolean {
+  return result.events.some(
+    (event) => event.type === "level-change" || event.type === "restart" || event.type === "undo",
+  );
+}
+
+/**
+ * Keep unfinished ink in the portable renderer when another queued turn
+ * starts. The semantic Ghostty bus samples the same merged cue set, but this
+ * primarily prevents CanvasFrame particles from being cut off by the shorter
+ * interaction lock.
+ */
+function mergeActivePrintTimelines(
+  previous: PrintTimeline,
+  next: PrintTimeline,
+  now: number,
+): PrintTimeline {
+  const surviving = previous.cues.filter((cue) => cue.startsAt + cue.durationMs > now);
+  if (surviving.length === 0) return next;
+
+  const cues = [...surviving, ...next.cues];
+  const startedAt = Math.min(next.startedAt, ...cues.map((cue) => cue.startsAt));
+  const end = Math.max(startedAt, ...cues.map((cue) => cue.startsAt + cue.durationMs));
+  return {
+    startedAt,
+    durationMs: end - startedAt,
+    cues,
+    trace: [...previous.trace, ...next.trace].slice(-4),
+  };
+}
+
 function interactionLock(result: TurnResult): number {
   if (result.events.some((event) => event.type === "win")) return 360;
   if (result.events.some((event) => event.type === "rules-changed")) return 250;
@@ -230,8 +273,12 @@ function sceneRuns(
   const lastByLayer = new Map<number, RenderRun>();
 
   for (const cell of scene.cells) {
-    const zIndex = cell.layer === "entity" ? 3 : cell.layer === "effect" ? 2 : 1;
-    const bucket = zIndex === 1 ? bed : zIndex === 2 ? effects : entities;
+    // Portable particles are short-lived gameplay feedback, so they must sit
+    // above the physical tile they annotate. Keeping effects below entities
+    // made push trails technically present but visually erased by the moving
+    // actor/crate faces.
+    const zIndex = cell.layer === "effect" ? 4 : cell.layer === "entity" ? 3 : 1;
+    const bucket = cell.layer === "bed" ? bed : cell.layer === "effect" ? effects : entities;
     const previous = lastByLayer.get(zIndex);
     if (
       zIndex === 1 &&
