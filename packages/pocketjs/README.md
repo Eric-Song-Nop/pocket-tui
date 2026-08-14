@@ -71,8 +71,12 @@ tracking. Known unsupported pixel-oriented properties increment diagnostics.
   5, 6, 10, 12, 15, 20, 30, or 60. The same value controls both the pump and
   Pocket's virtual clock. `run()` does not pass a wall-clock delta to `onFrame`.
 - Each terminal button event produces one press frame and one release frame.
-  Pending pulses are capped at eight, and repeated directions coalesce to the
-  newest direction.
+  Pending pulses are capped at eight. `directionPulsePolicy: "latest"` is the
+  default and coalesces pending directions to the newest one, which avoids
+  replaying stale terminal autorepeat in real-time controls.
+- Turn-based applications can select `directionPulsePolicy: "queue"`. It
+  preserves every mapped direction in arrival order; overflow still discards
+  the oldest pulse and every press still receives its own release frame.
 - A mapper may return one button mask or a bounded sequence of up to eight.
   The default mapper preserves recognized characters from a batched terminal
   text event, so inputs such as `.q` do not silently lose the quit command.

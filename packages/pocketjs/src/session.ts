@@ -27,6 +27,12 @@ export interface PocketTuiSessionOptions extends PocketTuiHostOptions {
   pocket?: Omit<MountOptions, "ops">;
   /** Virtual host frames per second while run() is active. Default: 30. */
   fps?: number;
+  /**
+   * Policy for pending directional button pulses. `latest` coalesces stale
+   * terminal autorepeat; `queue` preserves discrete turn-based commands.
+   * Default: `latest`.
+   */
+  directionPulsePolicy?: "latest" | "queue";
   /** Override the terminal-event to Pocket button-pulse mapping. */
   mapInput?: PocketInputMapper;
   /** Runs before mapInput; return true to consume an event. */
@@ -44,6 +50,7 @@ export class PocketTuiSession {
   readonly closed: Promise<void>;
   readonly #disposePocket: () => void;
   readonly #fps: number;
+  readonly #directionPulsePolicy: "latest" | "queue";
   readonly #mapInput: PocketInputMapper;
   readonly #onInput?: PocketInputHandler;
   readonly #releaseLease: () => void;
@@ -64,6 +71,9 @@ export class PocketTuiSession {
     this.host = host;
     this.#disposePocket = disposePocket;
     this.#fps = validateFps(options.fps ?? 30);
+    this.#directionPulsePolicy = validateDirectionPulsePolicy(
+      options.directionPulsePolicy ?? "latest",
+    );
     this.#mapInput = options.mapInput ?? defaultPocketInputMap;
     this.#onInput = options.onInput;
     this.#releaseLease = releaseLease;
@@ -151,7 +161,10 @@ export class PocketTuiSession {
   }
 
   #enqueueButtonPulse(buttons: number): void {
-    if ((buttons & DIRECTION_BUTTONS) !== 0) {
+    if (
+      this.#directionPulsePolicy === "latest" &&
+      (buttons & DIRECTION_BUTTONS) !== 0
+    ) {
       // Terminal autorepeat has no key-up signal. Only the freshest pending
       // direction is useful; replaying an old path after the user releases a
       // key makes controls feel sticky.
@@ -218,6 +231,7 @@ export async function mountPocketTui(
     throw new TypeError("PocketTUI: host cannot be combined with surface or tui options");
   }
   const fps = validateFps(options.fps ?? 30);
+  validateDirectionPulsePolicy(options.directionPulsePolicy ?? "latest");
   const releaseLease = acquirePocketRuntimeLease();
   let host: PocketTuiHost | undefined;
   let disposePocket: (() => void) | undefined;
@@ -328,6 +342,13 @@ function validateFps(value: number): number {
     throw new RangeError(
       `PocketTUI: fps must be one of ${VALID_SIMULATION_HZ.join(", ")}`,
     );
+  }
+  return value;
+}
+
+function validateDirectionPulsePolicy(value: unknown): "latest" | "queue" {
+  if (value !== "latest" && value !== "queue") {
+    throw new RangeError("PocketTUI: directionPulsePolicy must be one of latest, queue");
   }
   return value;
 }

@@ -1,6 +1,6 @@
 # PocketTUI
 
-PocketTUI is an architecture-first, terminal-native runtime for TypeScript and JavaScript applications. The repository contains a runnable alternate-screen runtime backed by Rust, N-API, and a small TypeScript API, plus **Signal Below**, a shader-enhanced roguelike built as the flagship retained-backend demo for PocketJS 0.6.
+PocketTUI is an architecture-first, terminal-native runtime for TypeScript and JavaScript applications. The repository contains a runnable alternate-screen runtime backed by Rust, N-API, and a small TypeScript API, plus two retained PocketJS 0.6 showcases: **RULE//SHIFT**, an animated rule-rewriting puzzle campaign, and **Signal Below**, a shader-enhanced roguelike.
 
 The target cost model is:
 
@@ -45,7 +45,7 @@ The MVP is intentionally narrower than the complete design in [`docs/architectur
 - `@pocket-tui/pocketjs` implements the real PocketJS 0.6 `HostOps` contract. PocketJS and Solid own signals, components, button handlers, and frame lifecycle; the backend owns a validated retained shadow tree.
 - Host mutations are laid out in terminal cells and rasterized into compact, terminal-independent Canvas runs. The backend—not the game—owns `CanvasHandle.present()`, PTX1 transport, and the handoff to Rust damage tracking.
 - The reference backend supports an explicit conservative `ansi16` mode and an opt-in `truecolor` mode. It does not probe terminal color capabilities.
-- Terminal input becomes bounded Pocket button pulses, with latest-direction coalescing and one release frame after each press. The session is currently a fixed-rate loop rather than the target event-driven scheduler.
+- Terminal input becomes bounded Pocket button pulses, with a latest-direction policy for real-time apps or an ordered queue for turn-based apps, plus one release frame after each press. The session is currently a fixed-rate loop rather than the target event-driven scheduler.
 - Pixel-only PocketJS features degrade explicitly: images use a placeholder, textures and sprites are unsupported, font atlases are ignored, and timed animation resolves immediately to its endpoint. Diagnostics count every fallback.
 
 See [`docs/pocketjs-backend.md`](docs/pocketjs-backend.md) for the complete data path, supported subset, frame/input contract, and degradation behavior.
@@ -89,6 +89,25 @@ bun run ghostty
 ```
 
 The Ghostty launcher changes no global configuration. See [`examples/roguelike/README.md`](examples/roguelike/README.md) for controls and [`examples/roguelike/GHOSTTY.md`](examples/roguelike/GHOSTTY.md) for the shader contract and limitations.
+
+Run the rule-rewriting puzzle campaign through the same retained PocketJS
+backend:
+
+```bash
+cd examples/rule-shift
+bun run start
+```
+
+Its optional Ghostty profile is also launcher-scoped:
+
+```bash
+bun run ghostty
+```
+
+`RULE//SHIFT` uses original stages, names, glyphs, and presentation. It is a
+clean-room mechanics study rather than a distribution of another game's level
+layouts or assets. See [`examples/rule-shift/README.md`](examples/rule-shift/README.md)
+for its campaign and controls.
 
 `bun run build` compiles the Rust N-API library, places the platform-specific `.node` file under `packages/core/native`, and builds both TypeScript packages. The basic example streams ordered chunks into a native DocumentDB block, seals it, displays memory statistics, polls one input event, and restores the terminal when it closes.
 
@@ -149,6 +168,7 @@ packages/core                public TypeScript API and PTX encoder
 packages/pocketjs            PocketJS 0.6 HostOps retained reference backend
 examples/basic               runnable streaming transcript example
 examples/roguelike           retained PocketJS roguelike and optional Ghostty shader
+examples/rule-shift          retained PocketJS rule-puzzle campaign and Syntax Loom shader
 docs/architecture.md         complete target design and invariants
 docs/pocketjs-backend.md      current backend data path and compatibility limits
 ```

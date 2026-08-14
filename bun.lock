@@ -18,7 +18,12 @@
       "name": "@pocket-tui/example-roguelike",
       "dependencies": {
         "@pocket-tui/pocketjs": "workspace:*",
-        "solid-js": "^1.9.9",
+      },
+    },
+    "examples/rule-shift": {
+      "name": "@pocket-tui/example-rule-shift",
+      "dependencies": {
+        "@pocket-tui/pocketjs": "workspace:*",
       },
     },
     "packages/core": {
@@ -67,6 +72,8 @@
     "@pocket-tui/example-basic": ["@pocket-tui/example-basic@workspace:examples/basic"],
 
     "@pocket-tui/example-roguelike": ["@pocket-tui/example-roguelike@workspace:examples/roguelike"],
+
+    "@pocket-tui/example-rule-shift": ["@pocket-tui/example-rule-shift@workspace:examples/rule-shift"],
 
     "@pocket-tui/pocketjs": ["@pocket-tui/pocketjs@workspace:packages/pocketjs"],
 
