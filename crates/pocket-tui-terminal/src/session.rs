@@ -4,14 +4,17 @@ use std::io::{self, Write};
 use std::os::fd::RawFd;
 use std::sync::Arc;
 
+use pocket_tui_core::Color;
 use pocket_tui_core::FrameArtifact;
 use thiserror::Error;
 
 use crate::capability::TerminalCapabilities;
-use crate::encoder::{EncodeError, encode_transition, resolve_frame};
+use crate::encoder::{
+    EncodeError, encode_transition, normalize_effect_presentation, resolve_frame,
+};
 use crate::guard::TerminalGuard;
 use crate::input::{InputError, InputEvent, TerminalInput};
-use crate::state::{PhysicalState, ScreenModel};
+use crate::state::{CursorState, EffectBusState, PhysicalState, ScreenModel};
 use crate::transport::FdWriter;
 
 /// Failure while opening, encoding, writing, or closing a terminal session.
@@ -83,6 +86,8 @@ pub struct TerminalSession<W: Write> {
     guard: Option<TerminalGuard>,
     confirmed: PhysicalState,
     desired: Option<Arc<ScreenModel>>,
+    desired_cursor: CursorState,
+    desired_effect_bus: EffectBusState,
     in_flight: Option<InFlight>,
     closed: bool,
 }
@@ -101,6 +106,8 @@ impl<W: Write> TerminalSession<W> {
             guard: None,
             confirmed: PhysicalState::empty(),
             desired: None,
+            desired_cursor: CursorState::default(),
+            desired_effect_bus: EffectBusState::default(),
             in_flight: None,
             closed: false,
         }
@@ -121,7 +128,31 @@ impl<W: Write> TerminalSession<W> {
     /// Submit a core frame and make as much write progress as the transport
     /// currently permits.
     pub fn present(&mut self, frame: &FrameArtifact) -> Result<SessionProgress, TerminalError> {
+        self.present_with_cursor(frame, CursorState::default())
+    }
+
+    /// Submit a frame with an explicit final cursor anchor. Ghostty exposes
+    /// this state to custom shaders, while ordinary terminals simply display
+    /// the requested cursor.
+    pub fn present_with_cursor(
+        &mut self,
+        frame: &FrameArtifact,
+        cursor: CursorState,
+    ) -> Result<SessionProgress, TerminalError> {
+        self.present_with_effect_bus(frame, cursor, EffectBusState::default())
+    }
+
+    /// Submit a frame, cursor anchor, and optional post-processing state as one
+    /// transactional terminal transition.
+    pub fn present_with_effect_bus(
+        &mut self,
+        frame: &FrameArtifact,
+        cursor: CursorState,
+        effect_bus: EffectBusState,
+    ) -> Result<SessionProgress, TerminalError> {
         self.ensure_open()?;
+        let (cursor, effect_bus) =
+            normalize_effect_presentation(cursor, effect_bus, self.capabilities);
         let desired = Arc::new(resolve_frame(frame)?);
         let latest = self
             .desired
@@ -134,7 +165,15 @@ impl<W: Write> TerminalSession<W> {
                 latest,
             });
         }
+        if let Some(guard) = self.guard.as_mut() {
+            guard.note_cursor_override(cursor.color != Color::Default, cursor.visible);
+            if effect_bus.enabled {
+                guard.note_effect_bus_override();
+            }
+        }
         self.desired = Some(desired);
+        self.desired_cursor = cursor;
+        self.desired_effect_bus = effect_bus;
         self.drive()
     }
 
@@ -214,11 +253,20 @@ impl<W: Write> TerminalSession<W> {
                 let Some(desired) = self.desired.as_ref() else {
                     return Ok(self.progress());
                 };
-                if desired.generation <= self.confirmed.generation() {
+                if desired.generation < self.confirmed.generation()
+                    || (desired.generation == self.confirmed.generation()
+                        && self.desired_cursor == self.confirmed.cursor()
+                        && self.desired_effect_bus == self.confirmed.effect_bus())
+                {
                     return Ok(self.progress());
                 }
-                let transition =
-                    encode_transition(&self.confirmed, Arc::clone(desired), self.capabilities);
+                let transition = encode_transition(
+                    &self.confirmed,
+                    Arc::clone(desired),
+                    self.desired_cursor,
+                    self.desired_effect_bus,
+                    self.capabilities,
+                );
                 self.in_flight = Some(InFlight {
                     bytes: transition.bytes,
                     offset: 0,
@@ -401,6 +449,44 @@ mod tests {
 
         let output = state.lock().unwrap().bytes.clone();
         assert_eq!(&output[..3], prefix.as_slice());
-        assert!(output.ends_with(b"\x1b[0m\x1b[H"));
+        assert!(output.ends_with(b"\x1b[0m\x1b[?25l\x1b[H"));
+    }
+
+    #[test]
+    fn effect_bus_confirmation_waits_for_the_exact_partial_write_suffix() {
+        let writer = ScriptedWriter::default();
+        let state = Arc::clone(&writer.state);
+        let mut session = TerminalSession::new(writer, TerminalCapabilities::ghostty());
+        let mut runtime = Runtime::new(Size::new(1, 1));
+        let frame = runtime.render_frame().unwrap();
+        let effect_bus = EffectBusState {
+            enabled: true,
+            channels: [[3, 40, 0], [200, 90, 255], [128, 128, 70]],
+            cursor_shade: true,
+        };
+
+        let blocked = session
+            .present_with_effect_bus(&frame, CursorState::default(), effect_bus)
+            .unwrap();
+        assert!(blocked.in_flight);
+        assert_eq!(
+            session.confirmed_state().effect_bus(),
+            EffectBusState::default()
+        );
+
+        state.lock().unwrap().blocked = false;
+        let complete = session.resume_write().unwrap();
+        assert!(complete.is_idle());
+        assert_eq!(session.confirmed_state().effect_bus(), effect_bus);
+
+        let output = state.lock().unwrap().bytes.clone();
+        let palette = b"\x1b]4;240;#505458;241;#032800;242;#c85aff;243;#808046\x1b\\";
+        assert!(output.windows(palette.len()).any(|bytes| bytes == palette));
+        let cursor_color = b"\x1b]12;#2ab8db\x1b\\";
+        assert!(
+            output
+                .windows(cursor_color.len())
+                .any(|bytes| bytes == cursor_color)
+        );
     }
 }

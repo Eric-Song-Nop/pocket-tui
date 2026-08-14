@@ -3,12 +3,20 @@
 use std::collections::{HashMap, HashSet};
 
 use pocket_tui_core::{
-    Axis, BlockId, BoxNode, DocumentId, Insets, LayoutSpec, NodeId, Runtime, Size, StyleId,
-    TextNode, TranscriptNode,
+    Axis, BlockId, BoxNode, CanvasNode, CanvasRun as CoreCanvasRun, Color, DocumentId, Insets,
+    LayoutSpec, NodeId, Runtime, Size, StyleId, TextAttributes, TextNode, TranscriptNode,
 };
-use pocket_tui_terminal::{FdWriter, InputEvent, TerminalCapabilities, TerminalSession};
+use pocket_tui_terminal::{
+    CursorShape as TerminalCursorShape, CursorState, EffectBusState, FdWriter, InputEvent,
+    TerminalCapabilities, TerminalSession,
+};
 
-use crate::protocol::{Direction, Operation, Packet};
+use crate::protocol::{
+    CanvasRun, ColorSpec, CursorShape, Direction, EffectBusProfile, Operation, Packet,
+};
+
+const DEFAULT_VIEWPORT: Size = Size::new(80, 24);
+const MAX_VIEWPORT_CELLS: u64 = 1_000_000;
 
 #[derive(Clone, Debug)]
 enum NodeSpec {
@@ -21,6 +29,11 @@ enum NodeSpec {
     Text(String),
     Transcript {
         document: u64,
+    },
+    Canvas {
+        width: u16,
+        height: u16,
+        runs: Vec<CoreCanvasRun>,
     },
 }
 
@@ -58,19 +71,31 @@ pub struct RuntimeAdapter {
     blocks: HashMap<u64, BlockBinding>,
     root: Option<u64>,
     session: Option<TerminalSession<FdWriter>>,
+    cursor: CursorState,
+    effect_bus: EffectBusState,
+    pending_resize: Option<Size>,
     dirty: bool,
     last_sequence: u64,
 }
 
 impl Default for RuntimeAdapter {
     fn default() -> Self {
+        let reported = terminal_size();
+        let initial_size = if viewport_area(reported) <= MAX_VIEWPORT_CELLS {
+            reported
+        } else {
+            DEFAULT_VIEWPORT
+        };
         Self {
-            runtime: Runtime::new(terminal_size()),
+            runtime: Runtime::new(initial_size),
             bindings: HashMap::new(),
             documents: HashMap::new(),
             blocks: HashMap::new(),
             root: None,
             session: None,
+            cursor: CursorState::default(),
+            effect_bus: EffectBusState::default(),
+            pending_resize: None,
             dirty: false,
             last_sequence: 0,
         }
@@ -106,6 +131,7 @@ impl RuntimeAdapter {
                     &mut self.documents,
                     &mut self.blocks,
                     &mut self.root,
+                    (&mut self.cursor, &mut self.effect_bus),
                     operation,
                 )?;
             }
@@ -117,6 +143,8 @@ impl RuntimeAdapter {
             let mut documents = self.documents.clone();
             let mut blocks = self.blocks.clone();
             let mut root = self.root;
+            let mut cursor = self.cursor;
+            let mut effect_bus = self.effect_bus;
             for operation in packet.operations {
                 apply_operation(
                     &mut runtime,
@@ -124,6 +152,7 @@ impl RuntimeAdapter {
                     &mut documents,
                     &mut blocks,
                     &mut root,
+                    (&mut cursor, &mut effect_bus),
                     operation,
                 )?;
             }
@@ -132,6 +161,8 @@ impl RuntimeAdapter {
             self.documents = documents;
             self.blocks = blocks;
             self.root = root;
+            self.cursor = cursor;
+            self.effect_bus = effect_bus;
         }
         self.last_sequence = packet.sequence;
         self.dirty = true;
@@ -142,7 +173,15 @@ impl RuntimeAdapter {
         if self.session.is_some() {
             return Ok(());
         }
-        let session = TerminalSession::open_stdio(TerminalCapabilities::conservative())
+        self.refresh_terminal_size()?;
+        let capabilities = if std::env::var_os("POCKET_TUI_GHOSTTY_EFFECTS").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            TerminalCapabilities::ghostty()
+        } else {
+            TerminalCapabilities::conservative()
+        };
+        let session = TerminalSession::open_stdio(capabilities)
             .map_err(|error| format!("failed to open terminal session: {error}"))?;
         self.session = Some(session);
         self.dirty = true;
@@ -150,6 +189,7 @@ impl RuntimeAdapter {
     }
 
     pub fn flush(&mut self) -> Result<(), String> {
+        self.refresh_terminal_size()?;
         let Some(session) = self.session.as_mut() else {
             return Ok(());
         };
@@ -159,7 +199,7 @@ impl RuntimeAdapter {
                 .render_frame()
                 .map_err(|error| format!("failed to render native scene: {error}"))?;
             session
-                .present(&frame)
+                .present_with_effect_bus(&frame, self.cursor, self.effect_bus)
                 .map_err(|error| format!("failed to present terminal frame: {error}"))?;
             self.dirty = false;
         }
@@ -168,23 +208,46 @@ impl RuntimeAdapter {
             .map_err(|error| format!("failed to flush terminal frame: {error}"))
     }
 
-    /// Drain every typed stdin event currently available. The terminal layer
-    /// keeps stdin nonblocking, so this is safe to call once per JS event-loop
-    /// turn. A future resize producer can use the same event path.
+    /// Drain every typed stdin event currently available and synthesize one
+    /// latest-value resize event when the tty dimensions have changed.
     pub fn poll_input(&mut self) -> Result<Vec<InputEvent>, String> {
-        let Some(session) = self.session.as_mut() else {
-            return Ok(Vec::new());
+        let mut events = if let Some(session) = self.session.as_mut() {
+            session
+                .poll_input()
+                .map_err(|error| format!("failed to poll terminal input: {error}"))?
+        } else {
+            Vec::new()
         };
-        let events = session
-            .poll_input()
-            .map_err(|error| format!("failed to poll terminal input: {error}"))?;
+
         for event in &events {
             if let InputEvent::Resize { columns, rows } = *event {
-                self.runtime.resize(Size::new(columns, rows));
-                self.dirty = true;
+                self.pending_resize = None;
+                self.apply_viewport_size(Size::new(columns, rows), false)?;
             }
         }
+
+        self.refresh_terminal_size()?;
+        if let Some(size) = self.pending_resize.take()
+            && !events.iter().any(|event| {
+                matches!(
+                    event,
+                    InputEvent::Resize { columns, rows }
+                        if *columns == size.columns && *rows == size.rows
+                )
+            })
+        {
+            events.push(InputEvent::Resize {
+                columns: size.columns,
+                rows: size.rows,
+            });
+        }
         Ok(events)
+    }
+
+    /// Return the current terminal viewport, refreshing it from the tty first.
+    pub fn viewport_size(&mut self) -> Result<Size, String> {
+        self.refresh_terminal_size()?;
+        Ok(self.runtime.size())
     }
 
     #[must_use]
@@ -221,7 +284,7 @@ impl RuntimeAdapter {
                 .render_frame()
                 .map_err(|error| format!("failed to render closing scene: {error}"))?;
             session
-                .present(&frame)
+                .present_with_effect_bus(&frame, self.cursor, self.effect_bus)
                 .map_err(|error| format!("failed to present closing frame: {error}"))?;
             self.dirty = false;
         }
@@ -229,6 +292,33 @@ impl RuntimeAdapter {
             .close_blocking()
             .map_err(|error| format!("failed to restore terminal: {error}"))
     }
+
+    fn refresh_terminal_size(&mut self) -> Result<(), String> {
+        self.apply_viewport_size(terminal_size(), true)
+    }
+
+    fn apply_viewport_size(&mut self, size: Size, notify: bool) -> Result<(), String> {
+        let cells = viewport_area(size);
+        if cells > MAX_VIEWPORT_CELLS {
+            return Err(format!(
+                "terminal viewport {}x{} contains {cells} cells; the safety limit is {MAX_VIEWPORT_CELLS}",
+                size.columns, size.rows
+            ));
+        }
+        if size == self.runtime.size() {
+            return Ok(());
+        }
+        self.runtime.resize(size);
+        self.dirty = true;
+        if notify {
+            self.pending_resize = Some(size);
+        }
+        Ok(())
+    }
+}
+
+fn viewport_area(size: Size) -> u64 {
+    u64::from(size.columns) * u64::from(size.rows)
 }
 
 fn is_hot_mutation(operation: &Operation<'_>) -> bool {
@@ -239,6 +329,9 @@ fn is_hot_mutation(operation: &Operation<'_>) -> bool {
             | Operation::OpenBlock { .. }
             | Operation::AppendBlockText { .. }
             | Operation::SealBlock { .. }
+            | Operation::SetCanvasFrame { .. }
+            | Operation::SetCursor { .. }
+            | Operation::SetEffectBus { .. }
     )
 }
 
@@ -341,6 +434,19 @@ fn validate_hot_operations(
                     .ok_or_else(|| format!("block {block} belongs to an unknown transcript"))?;
                 open_documents.remove(document);
             }
+            Operation::SetCanvasFrame {
+                handle,
+                width,
+                height,
+                runs,
+            } => {
+                if !matches!(&binding(bindings, *handle)?.spec, NodeSpec::Canvas { .. }) {
+                    return Err(format!("node {handle} is not Canvas"));
+                }
+                validate_canvas_frame(*width, *height, runs)?;
+            }
+            Operation::SetCursor { .. } => {}
+            Operation::SetEffectBus { .. } => {}
             _ => unreachable!("guarded by is_hot_mutation"),
         }
     }
@@ -359,8 +465,10 @@ fn apply_operation(
     documents: &mut HashMap<u64, DocumentId>,
     blocks: &mut HashMap<u64, BlockBinding>,
     root: &mut Option<u64>,
+    presentation: (&mut CursorState, &mut EffectBusState),
     operation: Operation<'_>,
 ) -> Result<(), String> {
+    let (cursor, effect_bus) = presentation;
     match operation {
         Operation::CreateBox {
             handle,
@@ -526,6 +634,85 @@ fn apply_operation(
                 },
             )
         }
+        Operation::CreateCanvas { handle } => insert_binding(
+            bindings,
+            documents,
+            blocks,
+            handle,
+            NodeSpec::Canvas {
+                width: 1,
+                height: 1,
+                runs: Vec::new(),
+            },
+        ),
+        Operation::SetCanvasFrame {
+            handle,
+            width,
+            height,
+            runs,
+        } => {
+            let runs = convert_canvas_runs(width, height, &runs)?;
+            let value = binding_mut(bindings, handle)?;
+            let NodeSpec::Canvas {
+                width: current_width,
+                height: current_height,
+                runs: current_runs,
+            } = &mut value.spec
+            else {
+                return Err(format!("node {handle} is not Canvas"));
+            };
+            *current_width = width;
+            *current_height = height;
+            current_runs.clone_from(&runs);
+            let native = value.native;
+            if let Some(native) = native {
+                runtime
+                    .scene_mut()
+                    .set_canvas_frame(native, width, height, runs)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
+        Operation::SetCursor {
+            row,
+            column,
+            visible,
+            shape,
+            color,
+        } => {
+            *cursor = CursorState {
+                row,
+                column,
+                visible,
+                shape: match shape {
+                    CursorShape::Block => TerminalCursorShape::Block,
+                    CursorShape::Underline => TerminalCursorShape::Underline,
+                    CursorShape::Bar => TerminalCursorShape::Bar,
+                },
+                color: convert_color(color),
+            };
+            Ok(())
+        }
+        Operation::SetEffectBus {
+            profile,
+            enabled,
+            trigger,
+            channels,
+        } => {
+            if profile != EffectBusProfile::GhosttyPaletteV1 {
+                return Err("unsupported effect bus profile".to_owned());
+            }
+            if enabled {
+                effect_bus.enabled = true;
+                effect_bus.channels = channels;
+                if trigger {
+                    effect_bus.cursor_shade = !effect_bus.cursor_shade;
+                }
+            } else {
+                *effect_bus = EffectBusState::default();
+            }
+            Ok(())
+        }
     }
 }
 
@@ -601,6 +788,22 @@ fn materialize(
                 .create_transcript(native_parent, transcript)
                 .map_err(|error| error.to_string())?
         }
+        NodeSpec::Canvas {
+            width,
+            height,
+            runs,
+        } => runtime
+            .scene_mut()
+            .create_canvas(
+                native_parent,
+                CanvasNode {
+                    width,
+                    height,
+                    runs,
+                    ..CanvasNode::default()
+                },
+            )
+            .map_err(|error| error.to_string())?,
     };
     binding_mut(bindings, handle)?.native = Some(native);
     Ok(native)
@@ -628,7 +831,57 @@ fn set_pending_text(
 fn require_box(bindings: &HashMap<u64, Binding>, handle: u64) -> Result<(), String> {
     match &binding(bindings, handle)?.spec {
         NodeSpec::Box { .. } => Ok(()),
-        NodeSpec::Text(_) | NodeSpec::Transcript { .. } => Err(format!("node {handle} is not Box")),
+        NodeSpec::Text(_) | NodeSpec::Transcript { .. } | NodeSpec::Canvas { .. } => {
+            Err(format!("node {handle} is not Box"))
+        }
+    }
+}
+
+fn validate_canvas_frame(width: u16, height: u16, runs: &[CanvasRun<'_>]) -> Result<(), String> {
+    if width == 0 || height == 0 {
+        return Err("canvas dimensions must be non-zero".to_owned());
+    }
+    for (index, run) in runs.iter().enumerate() {
+        if run.row >= height || run.column >= width {
+            return Err(format!("canvas run {index} starts outside the frame"));
+        }
+        if run.text.is_empty() {
+            return Err(format!("canvas run {index} is empty"));
+        }
+        if run.text.contains(['\r', '\n']) {
+            return Err(format!("canvas run {index} contains a line break"));
+        }
+        if run.attributes & !TextAttributes::all().bits() != 0 {
+            return Err(format!("canvas run {index} uses unknown style attributes"));
+        }
+    }
+    Ok(())
+}
+
+fn convert_canvas_runs(
+    width: u16,
+    height: u16,
+    runs: &[CanvasRun<'_>],
+) -> Result<Vec<CoreCanvasRun>, String> {
+    validate_canvas_frame(width, height, runs)?;
+    Ok(runs
+        .iter()
+        .map(|run| CoreCanvasRun {
+            row: run.row,
+            column: run.column,
+            text: run.text.to_owned(),
+            foreground: convert_color(run.foreground),
+            background: convert_color(run.background),
+            attributes: TextAttributes::from_bits_retain(run.attributes),
+        })
+        .collect())
+}
+
+fn convert_color(color: ColorSpec) -> Color {
+    match color {
+        ColorSpec::Default => Color::Default,
+        ColorSpec::Indexed(index) => Color::Indexed(index),
+        ColorSpec::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
     }
 }
 
@@ -664,15 +917,155 @@ fn descendants_including(bindings: &HashMap<u64, Binding>, root: u64) -> HashSet
 }
 
 fn terminal_size() -> Size {
-    let columns = env_dimension("COLUMNS", 80);
-    let rows = env_dimension("LINES", 24);
-    Size::new(columns, rows)
+    choose_terminal_size(
+        ioctl_terminal_size(libc::STDOUT_FILENO),
+        ioctl_terminal_size(libc::STDIN_FILENO),
+        env_dimension("COLUMNS"),
+        env_dimension("LINES"),
+    )
 }
 
-fn env_dimension(name: &str, fallback: u16) -> u16 {
+fn ioctl_terminal_size(fd: libc::c_int) -> Option<Size> {
+    // SAFETY: `size` points to writable storage and TIOCGWINSZ only reads the
+    // borrowed file descriptor while filling that fixed-size structure.
+    let mut size = unsafe { std::mem::zeroed::<libc::winsize>() };
+    let result = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) };
+    if result == 0 && size.ws_col > 0 && size.ws_row > 0 {
+        Some(Size::new(size.ws_col, size.ws_row))
+    } else {
+        None
+    }
+}
+
+fn env_dimension(name: &str) -> Option<u16> {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(fallback)
+}
+
+fn choose_terminal_size(
+    stdout: Option<Size>,
+    stdin: Option<Size>,
+    env_columns: Option<u16>,
+    env_rows: Option<u16>,
+) -> Size {
+    stdout.or(stdin).unwrap_or_else(|| {
+        Size::new(
+            env_columns.unwrap_or(DEFAULT_VIEWPORT.columns),
+            env_rows.unwrap_or(DEFAULT_VIEWPORT.rows),
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_size_prefers_stdout_then_stdin_then_environment() {
+        let stdout = Size::new(132, 43);
+        let stdin = Size::new(100, 30);
+
+        assert_eq!(
+            choose_terminal_size(Some(stdout), Some(stdin), Some(90), Some(28)),
+            stdout
+        );
+        assert_eq!(
+            choose_terminal_size(None, Some(stdin), Some(90), Some(28)),
+            stdin
+        );
+        assert_eq!(
+            choose_terminal_size(None, None, Some(90), Some(28)),
+            Size::new(90, 28)
+        );
+        assert_eq!(
+            choose_terminal_size(None, None, None, None),
+            Size::new(80, 24)
+        );
+    }
+
+    #[test]
+    fn resize_notifications_keep_only_the_latest_viewport() {
+        let mut adapter = RuntimeAdapter::default();
+        adapter.runtime = Runtime::new(Size::new(80, 24));
+        adapter.dirty = false;
+        adapter.pending_resize = None;
+
+        adapter
+            .apply_viewport_size(Size::new(100, 30), true)
+            .unwrap();
+        adapter
+            .apply_viewport_size(Size::new(120, 40), true)
+            .unwrap();
+
+        assert_eq!(adapter.runtime.size(), Size::new(120, 40));
+        assert_eq!(adapter.pending_resize, Some(Size::new(120, 40)));
+        assert!(adapter.dirty);
+    }
+
+    #[test]
+    fn oversized_viewport_is_rejected_without_mutating_runtime_state() {
+        let mut adapter = RuntimeAdapter::default();
+        adapter.runtime = Runtime::new(Size::new(80, 24));
+        adapter.dirty = false;
+        adapter.pending_resize = None;
+
+        let error = adapter
+            .apply_viewport_size(Size::new(u16::MAX, u16::MAX), true)
+            .unwrap_err();
+
+        assert!(error.contains("safety limit"));
+        assert_eq!(adapter.runtime.size(), Size::new(80, 24));
+        assert!(!adapter.dirty);
+        assert_eq!(adapter.pending_resize, None);
+    }
+
+    #[test]
+    fn hot_packet_does_not_publish_effect_state_before_full_validation() {
+        let mut adapter = RuntimeAdapter::default();
+        let channels = [[3, 40, 0], [200, 90, 255], [128, 128, 70]];
+        let invalid = Packet {
+            flags: 0,
+            sequence: 1,
+            operations: vec![
+                Operation::SetEffectBus {
+                    profile: EffectBusProfile::GhosttyPaletteV1,
+                    enabled: true,
+                    trigger: true,
+                    channels,
+                },
+                Operation::SetText {
+                    handle: 99,
+                    text: "missing",
+                },
+            ],
+        };
+
+        assert!(adapter.apply(invalid).unwrap_err().contains("unknown node"));
+        assert_eq!(adapter.effect_bus, EffectBusState::default());
+        assert_eq!(adapter.last_sequence, 0);
+        assert!(!adapter.dirty);
+
+        adapter
+            .apply(Packet {
+                flags: 0,
+                sequence: 1,
+                operations: vec![Operation::SetEffectBus {
+                    profile: EffectBusProfile::GhosttyPaletteV1,
+                    enabled: true,
+                    trigger: true,
+                    channels,
+                }],
+            })
+            .unwrap();
+        assert_eq!(
+            adapter.effect_bus,
+            EffectBusState {
+                enabled: true,
+                channels,
+                cursor_shade: true,
+            }
+        );
+    }
 }

@@ -4,7 +4,10 @@ use std::io;
 use std::os::fd::RawFd;
 
 const ENTER_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[0m";
-const LEAVE_ALTERNATE_SCREEN: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?1049l";
+const RESET_CURSOR_COLOR: &[u8] = b"\x1b]112\x1b\\";
+const RESET_EFFECT_BUS: &[u8] = b"\x1b]104;240;241;242;243\x1b\\";
+const RESET_CURSOR_SHAPE: &[u8] = b"\x1b[0 q";
+const LEAVE_ALTERNATE_SCREEN: &[u8] = b"\x1b[?25h\x1b[?1049l";
 
 /// Restores Unix terminal modes, cursor visibility, and the main screen on drop.
 ///
@@ -16,6 +19,9 @@ pub struct TerminalGuard {
     input_fd: RawFd,
     output_fd: RawFd,
     original_termios: libc::termios,
+    cursor_color_overridden: bool,
+    cursor_shape_overridden: bool,
+    effect_bus_overridden: bool,
     active: bool,
 }
 
@@ -57,6 +63,9 @@ impl TerminalGuard {
             input_fd,
             output_fd,
             original_termios: original,
+            cursor_color_overridden: false,
+            cursor_shape_overridden: false,
+            effect_bus_overridden: false,
             active: true,
         })
     }
@@ -72,7 +81,14 @@ impl TerminalGuard {
             return Ok(());
         }
 
-        let output_result = write_all_fd(self.output_fd, LEAVE_ALTERNATE_SCREEN);
+        let output_result = write_all_fd(
+            self.output_fd,
+            &restoration_bytes(
+                self.cursor_color_overridden,
+                self.cursor_shape_overridden,
+                self.effect_bus_overridden,
+            ),
+        );
         // SAFETY: the descriptor is borrowed and the saved termios remains
         // initialized for the lifetime of this guard.
         let termios_result = unsafe {
@@ -91,6 +107,18 @@ impl TerminalGuard {
     #[must_use]
     pub const fn is_active(&self) -> bool {
         self.active
+    }
+
+    /// Record cursor state that must be reset if the process exits early.
+    pub fn note_cursor_override(&mut self, color: bool, shape: bool) {
+        self.cursor_color_overridden |= color;
+        self.cursor_shape_overridden |= shape;
+    }
+
+    /// Record that the four reserved effect-bus palette slots need cleanup.
+    pub fn note_effect_bus_override(&mut self) {
+        self.effect_bus_overridden = true;
+        self.cursor_color_overridden = true;
     }
 }
 
@@ -135,4 +163,41 @@ fn write_all_fd(fd: RawFd, mut bytes: &[u8]) -> io::Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+fn restoration_bytes(reset_color: bool, reset_shape: bool, reset_effect_bus: bool) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(80);
+    bytes.extend_from_slice(b"\x1b[0m");
+    if reset_effect_bus {
+        bytes.extend_from_slice(RESET_EFFECT_BUS);
+    }
+    if reset_color {
+        bytes.extend_from_slice(RESET_CURSOR_COLOR);
+    }
+    if reset_shape {
+        bytes.extend_from_slice(RESET_CURSOR_SHAPE);
+    }
+    bytes.extend_from_slice(LEAVE_ALTERNATE_SCREEN);
+    bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::restoration_bytes;
+
+    #[test]
+    fn cursor_resets_are_emitted_only_after_an_override() {
+        assert_eq!(
+            restoration_bytes(false, false, false),
+            b"\x1b[0m\x1b[?25h\x1b[?1049l"
+        );
+        assert_eq!(
+            restoration_bytes(true, true, false),
+            b"\x1b[0m\x1b]112\x1b\\\x1b[0 q\x1b[?25h\x1b[?1049l"
+        );
+        assert_eq!(
+            restoration_bytes(true, true, true),
+            b"\x1b[0m\x1b]104;240;241;242;243\x1b\\\x1b]112\x1b\\\x1b[0 q\x1b[?25h\x1b[?1049l"
+        );
+    }
 }

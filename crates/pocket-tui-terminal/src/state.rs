@@ -2,6 +2,17 @@
 
 use std::sync::Arc;
 
+use pocket_tui_core::Color;
+
+/// Steady DEC cursor presentation used by the terminal and shader anchor.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CursorShape {
+    #[default]
+    Block,
+    Underline,
+    Bar,
+}
+
 /// Cursor state predicted after the last completely written patch.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CursorState {
@@ -11,6 +22,21 @@ pub struct CursorState {
     pub column: u16,
     /// Whether the cursor is visible.
     pub visible: bool,
+    /// Requested steady cursor shape.
+    pub shape: CursorShape,
+    /// Desired cursor color; `Default` restores the terminal theme.
+    pub color: Color,
+}
+
+/// Opaque state carried to an optional terminal post-processing shader.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EffectBusState {
+    /// Whether the profile signature and channels should be installed.
+    pub enabled: bool,
+    /// Three application-defined RGB-byte channels.
+    pub channels: [[u8; 3]; 3],
+    /// Alternates the nearly-identical cursor shade used as an event timestamp.
+    pub cursor_shade: bool,
 }
 
 /// Terminal state that is safe to use as a diff baseline.
@@ -22,6 +48,7 @@ pub struct PhysicalState {
     generation: u64,
     screen: Option<Arc<ScreenModel>>,
     cursor: CursorState,
+    effect_bus: EffectBusState,
 }
 
 impl PhysicalState {
@@ -33,19 +60,23 @@ impl PhysicalState {
                 row: 0,
                 column: 0,
                 visible: false,
+                shape: CursorShape::Block,
+                color: Color::Default,
             },
+            effect_bus: EffectBusState::default(),
         }
     }
 
-    pub(crate) fn for_screen(screen: Arc<ScreenModel>) -> Self {
+    pub(crate) fn for_screen(
+        screen: Arc<ScreenModel>,
+        cursor: CursorState,
+        effect_bus: EffectBusState,
+    ) -> Self {
         Self {
             generation: screen.generation,
             screen: Some(screen),
-            cursor: CursorState {
-                row: 0,
-                column: 0,
-                visible: false,
-            },
+            cursor,
+            effect_bus,
         }
     }
 
@@ -68,6 +99,12 @@ impl PhysicalState {
     #[must_use]
     pub const fn cursor(&self) -> CursorState {
         self.cursor
+    }
+
+    /// Confirmed effect-bus state after the last complete transition.
+    #[must_use]
+    pub const fn effect_bus(&self) -> EffectBusState {
+        self.effect_bus
     }
 
     pub(crate) fn screen(&self) -> Option<&ScreenModel> {

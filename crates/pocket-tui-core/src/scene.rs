@@ -3,7 +3,8 @@
 use thiserror::Error;
 
 use crate::{
-    Axis, DirtyMask, DirtyReason, DirtyState, DocumentId, Insets, LayoutSpec, Rect, StyleId,
+    Axis, Color, DirtyMask, DirtyReason, DirtyState, DocumentId, Insets, LayoutSpec, Rect, StyleId,
+    TextAttributes,
 };
 
 /// Opaque generational scene handle.
@@ -92,6 +93,37 @@ pub struct TranscriptNode {
     pub block_gap: u16,
 }
 
+/// One styled, single-line text run within a canvas-local coordinate space.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanvasRun {
+    pub row: u16,
+    pub column: u16,
+    pub text: String,
+    pub foreground: Color,
+    pub background: Color,
+    pub attributes: TextAttributes,
+}
+
+/// A bounded application-drawn cell surface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanvasNode {
+    pub width: u16,
+    pub height: u16,
+    pub runs: Vec<CanvasRun>,
+    pub layout: LayoutSpec,
+}
+
+impl Default for CanvasNode {
+    fn default() -> Self {
+        Self {
+            width: 1,
+            height: 1,
+            runs: Vec::new(),
+            layout: LayoutSpec::FILL,
+        }
+    }
+}
+
 impl TranscriptNode {
     pub fn new(document: DocumentId) -> Self {
         Self {
@@ -110,6 +142,7 @@ pub enum NodeKind {
     Box(BoxNode),
     Text(TextNode),
     Transcript(TranscriptNode),
+    Canvas(CanvasNode),
 }
 
 /// One active or retained scene node.
@@ -157,6 +190,7 @@ impl Node {
             NodeKind::Box(node) => node.layout,
             NodeKind::Text(node) => node.layout,
             NodeKind::Transcript(node) => node.layout,
+            NodeKind::Canvas(node) => node.layout,
         }
     }
 }
@@ -207,6 +241,37 @@ impl SceneDb {
         value: TranscriptNode,
     ) -> Result<NodeId, SceneError> {
         self.create(parent, NodeKind::Transcript(value))
+    }
+
+    pub fn create_canvas(
+        &mut self,
+        parent: Option<NodeId>,
+        value: CanvasNode,
+    ) -> Result<NodeId, SceneError> {
+        self.create(parent, NodeKind::Canvas(value))
+    }
+
+    pub fn set_canvas_frame(
+        &mut self,
+        id: NodeId,
+        width: u16,
+        height: u16,
+        runs: Vec<CanvasRun>,
+    ) -> Result<(), SceneError> {
+        {
+            let node = self.node_slot_mut(id)?;
+            let NodeKind::Canvas(value) = &mut node.kind else {
+                return Err(SceneError::WrongKind(id));
+            };
+            if value.width == width && value.height == height && value.runs == runs {
+                return Ok(());
+            }
+            value.width = width;
+            value.height = height;
+            value.runs = runs;
+        }
+        let generation = self.bump_generation();
+        self.mark(id, DirtyReason::CanvasChanged, generation)
     }
 
     fn create(&mut self, parent: Option<NodeId>, kind: NodeKind) -> Result<NodeId, SceneError> {
@@ -354,6 +419,14 @@ impl SceneDb {
                     node.children.capacity() * core::mem::size_of::<NodeId>()
                         + match &node.kind {
                             NodeKind::Text(text) => text.text.capacity(),
+                            NodeKind::Canvas(canvas) => {
+                                canvas.runs.capacity() * core::mem::size_of::<CanvasRun>()
+                                    + canvas
+                                        .runs
+                                        .iter()
+                                        .map(|run| run.text.capacity())
+                                        .sum::<usize>()
+                            }
                             NodeKind::Box(_) | NodeKind::Transcript(_) => 0,
                         }
                 })

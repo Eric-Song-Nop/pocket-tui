@@ -4,21 +4,40 @@ import {
   type NativeInputEvent,
   type NativeMemoryStats,
   type NativeTuiSession,
+  type NativeViewportSize,
 } from "./native.js";
-import { PtxPacketEncoder, type BoxPacketOptions } from "./protocol.js";
+import {
+  PtxPacketEncoder,
+  type BoxPacketOptions,
+  type CanvasFrame,
+  type CursorPacketOptions,
+  type EffectBusChannel,
+  type EffectBusPacketOptions,
+  type EffectBusProfile,
+} from "./protocol.js";
 
 export type FlushMode = "accepted" | "painted" | "terminal";
 export type TuiAppState = "created" | "active" | "closed";
 export type TuiInputEvent = NativeInputEvent;
 export type TuiMemoryStats = Readonly<NativeMemoryStats>;
+export type TuiViewportSize = Readonly<NativeViewportSize>;
 
 export interface CreateTuiOptions {
   /** Alternate-screen is the only MVP surface. */
   surface?: "alternate";
+  /** Optional terminal-specific post-processing state channel. */
+  effectBus?: EffectBusProfile;
   /** Override used by embedders and protocol smoke tests. */
   nativeBinding?: NativeBinding;
   /** Explicit `.node` artifact path; normally resolved automatically. */
   nativePath?: string;
+}
+
+export interface EffectBusFrame {
+  readonly enabled?: boolean;
+  /** Restart the shader event clock even if every channel is unchanged. */
+  readonly trigger?: boolean;
+  readonly channels?: readonly [EffectBusChannel, EffectBusChannel, EffectBusChannel];
 }
 
 type Command =
@@ -33,7 +52,11 @@ type Command =
   | { kind: "openBlock"; transcript: bigint; block: bigint }
   | { kind: "appendBlockText"; block: bigint; text: string }
   | { kind: "sealBlock"; block: bigint }
-  | { kind: "createVirtualTranscript"; handle: bigint; transcript: bigint };
+  | { kind: "createVirtualTranscript"; handle: bigint; transcript: bigint }
+  | { kind: "createCanvas"; handle: bigint }
+  | { kind: "setCanvasFrame"; handle: bigint; frame: CanvasFrame }
+  | { kind: "setCursor"; options: CursorPacketOptions }
+  | { kind: "setEffectBus"; options: EffectBusPacketOptions };
 
 export abstract class SceneHandle {
   readonly id: bigint;
@@ -98,6 +121,12 @@ export class BoxHandle extends SceneHandle {
     this.append(child);
     return child;
   }
+
+  canvas(): CanvasHandle {
+    const child = this._owner().canvas();
+    this.append(child);
+    return child;
+  }
 }
 
 export class TextHandle extends SceneHandle {
@@ -126,6 +155,20 @@ export class VirtualTranscriptHandle extends SceneHandle {
   constructor(app: TuiApp, id: bigint, transcript: TranscriptHandle) {
     super(app, id);
     this.transcript = transcript;
+  }
+}
+
+/** A retained, styled cell surface intended for games, charts, and custom widgets. */
+export class CanvasHandle extends SceneHandle {
+  /** @internal */
+  constructor(app: TuiApp, id: bigint) {
+    super(app, id);
+  }
+
+  present(frame: CanvasFrame): this {
+    this._assertLive();
+    this._owner()._setCanvasFrame(this.id, frame);
+    return this;
   }
 }
 
@@ -198,6 +241,9 @@ export class TuiApp {
     if (options.surface !== undefined && options.surface !== "alternate") {
       throw new RangeError("The PocketTUI MVP currently supports only surface: 'alternate'");
     }
+    if (options.effectBus !== undefined && options.effectBus !== "ghostty-palette-v1") {
+      throw new RangeError(`Unsupported effect bus profile: ${String(options.effectBus)}`);
+    }
     this.options = Object.freeze({ ...options, surface: "alternate" });
   }
 
@@ -236,6 +282,55 @@ export class TuiApp {
     return new VirtualTranscriptHandle(this, handle, transcript);
   }
 
+  canvas(): CanvasHandle {
+    this._assertOpen();
+    const handle = this.#allocateHandle();
+    this.#enqueue({ kind: "createCanvas", handle });
+    return new CanvasHandle(this, handle);
+  }
+
+  /** Set the real terminal cursor used by IME and Ghostty shader integrations. */
+  setCursor(options: CursorPacketOptions): void {
+    this._assertOpen();
+    this.#enqueue({
+      kind: "setCursor",
+      options: {
+        ...options,
+        color: options.color === undefined ? undefined : { ...options.color },
+      },
+    });
+  }
+
+  /** Publish three opaque channels to the configured terminal effect profile. */
+  setEffectBus(frame: EffectBusFrame): void {
+    this._assertOpen();
+    const profile = this.options.effectBus;
+    if (profile === undefined) {
+      throw new Error("Create the TUI with effectBus: 'ghostty-palette-v1' before publishing effects");
+    }
+    this.#enqueue({
+      kind: "setEffectBus",
+      options: {
+        profile,
+        enabled: frame.enabled,
+        trigger: frame.trigger,
+        channels:
+          frame.channels === undefined
+            ? undefined
+            : frame.channels.map((channel) => [...channel] as EffectBusChannel) as [
+                EffectBusChannel,
+                EffectBusChannel,
+                EffectBusChannel,
+              ],
+      },
+    });
+  }
+
+  /** Disable the configured effect bus and restore its reserved palette slots. */
+  clearEffectBus(): void {
+    this.setEffectBus({ enabled: false });
+  }
+
   mount(root: SceneHandle): this {
     root._assertLive();
     if (root._owner() !== this) throw new TypeError("Root handle is owned by another TuiApp");
@@ -256,11 +351,10 @@ export class TuiApp {
     this._assertOpen();
     this.#throwAsyncError();
     if (this.#state === "active") return;
-    if (this.#root === undefined) throw new Error("Mount a root Box or Text before start()");
-    const binding = this.options.nativeBinding ?? loadNativeBinding(this.options.nativePath);
-    this.#native = new binding.NativeTui();
+    if (this.#root === undefined) throw new Error("Mount a root Box, Text, or Canvas before start()");
+    const native = this.#ensureNative();
     this.#commitPending();
-    this.#native.start();
+    native.start();
     this.#state = "active";
   }
 
@@ -277,6 +371,14 @@ export class TuiApp {
     this._assertOpen();
     this.#throwAsyncError();
     return this.#native?.pollInput() ?? [];
+  }
+
+  /** Read the current terminal viewport in character cells. */
+  viewportSize(): TuiViewportSize {
+    this._assertOpen();
+    this.#throwAsyncError();
+    const size = this.#ensureNative().viewportSize?.() ?? environmentViewportSize();
+    return Object.freeze({ columns: size.columns, rows: size.rows });
   }
 
   /** Snapshot byte/count telemetry owned by the native runtime. */
@@ -353,6 +455,31 @@ export class TuiApp {
   }
 
   /** @internal */
+  _setCanvasFrame(handle: bigint, frame: CanvasFrame): void {
+    this.#enqueue({
+      kind: "setCanvasFrame",
+      handle,
+      frame: {
+        width: frame.width,
+        height: frame.height,
+        runs: frame.runs.map((run) => ({
+          ...run,
+          style:
+            run.style === undefined
+              ? undefined
+              : {
+                  ...run.style,
+                  foreground:
+                    run.style.foreground === undefined ? undefined : { ...run.style.foreground },
+                  background:
+                    run.style.background === undefined ? undefined : { ...run.style.background },
+                },
+        })),
+      },
+    });
+  }
+
+  /** @internal */
   _assertOpen(): void {
     if (this.#state === "closed") throw new Error("TuiApp is closed");
   }
@@ -396,12 +523,27 @@ export class TuiApp {
     this.#sequence += 1n;
   }
 
+  #ensureNative(): NativeTuiSession {
+    if (this.#native !== undefined) return this.#native;
+    const binding = this.options.nativeBinding ?? loadNativeBinding(this.options.nativePath);
+    this.#native = new binding.NativeTui();
+    return this.#native;
+  }
+
   #throwAsyncError(): void {
     if (this.#asyncError === undefined) return;
     const error = this.#asyncError;
     this.#asyncError = undefined;
     throw error;
   }
+}
+
+function environmentViewportSize(): NativeViewportSize {
+  const dimension = (name: "COLUMNS" | "LINES", fallback: number): number => {
+    const value = Number(process.env[name]);
+    return Number.isInteger(value) && value > 0 && value <= 0xffff ? value : fallback;
+  };
+  return { columns: dimension("COLUMNS", 80), rows: dimension("LINES", 24) };
 }
 
 export function createTui(options: CreateTuiOptions = {}): TuiApp {
@@ -445,6 +587,18 @@ function encodeCommand(encoder: PtxPacketEncoder, command: Command): void {
       break;
     case "createVirtualTranscript":
       encoder.createVirtualTranscript(command.handle, command.transcript);
+      break;
+    case "createCanvas":
+      encoder.createCanvas(command.handle);
+      break;
+    case "setCanvasFrame":
+      encoder.setCanvasFrame(command.handle, command.frame);
+      break;
+    case "setCursor":
+      encoder.setCursor(command.options);
+      break;
+    case "setEffectBus":
+      encoder.setEffectBus(command.options);
       break;
   }
 }

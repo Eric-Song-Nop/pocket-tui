@@ -6,8 +6,14 @@ export interface NativeTuiSession {
   start(): void;
   flush(): void;
   pollInput(): NativeInputEvent[];
+  viewportSize?(): NativeViewportSize;
   memoryStats(): NativeMemoryStats;
   close(): void;
+}
+
+export interface NativeViewportSize {
+  columns: number;
+  rows: number;
 }
 
 export interface NativeMemoryStats {
