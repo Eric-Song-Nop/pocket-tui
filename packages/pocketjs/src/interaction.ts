@@ -7,14 +7,19 @@ export interface TextInteraction {
   readonly node: NodeMirror;
   readonly cursorNode: NodeMirror;
   handleInput(event: TuiInputEvent): boolean;
+  updateViewport(width: number, height: number): boolean;
   cursorOffset(width: number, height: number): { row: number; column: number };
 }
 
+type FocusListener = (focused: boolean) => void;
+
 const textInteractions = new Map<NodeMirror, TextInteraction>();
 const buttonInteractions = new Set<NodeMirror>();
+const focusListeners = new Map<NodeMirror, Set<FocusListener>>();
 let cursorOwned = false;
 let lastCursorKey = "";
 let pasteInteraction: TextInteraction | undefined;
+let syncedFocus: NodeMirror | null = null;
 
 /** @internal Register a focusable component that consumes terminal text input. */
 export function registerTextInteraction(interaction: TextInteraction): () => void {
@@ -40,6 +45,52 @@ export function registerButtonInteraction(node: NodeMirror): () => void {
     disposed = true;
     buttonInteractions.delete(node);
   };
+}
+
+/** @internal Observe Pocket's focus tree from the client Solid runtime. */
+export function registerFocusListener(node: NodeMirror, listener: FocusListener): () => void {
+  let listeners = focusListeners.get(node);
+  if (listeners === undefined) {
+    listeners = new Set();
+    focusListeners.set(node, listeners);
+  }
+  listeners.add(listener);
+  try {
+    listener(getFocused() === node);
+  } catch (error) {
+    listeners.delete(listener);
+    if (listeners.size === 0) focusListeners.delete(node);
+    throw error;
+  }
+  let disposed = false;
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    listeners?.delete(listener);
+    if (listeners?.size === 0) focusListeners.delete(node);
+  };
+}
+
+/** @internal Synchronize imperative Pocket focus into registered Solid owners. */
+export function syncInteractionFocus(): void {
+  // Focus callbacks may legally redirect focus. Publish one transition at a
+  // time and re-read Pocket's authoritative focus after every callback so
+  // reactive styling settles on the node that will actually receive input.
+  for (let step = 0; step < 64; step += 1) {
+    const focused = getFocused();
+    if (focused === syncedFocus) return;
+    if (syncedFocus !== null) {
+      const blurred = syncedFocus;
+      syncedFocus = null;
+      notifyFocus(blurred, false);
+      continue;
+    }
+    if (focused !== null) {
+      syncedFocus = focused;
+      notifyFocus(focused, true);
+    }
+  }
+  throw new Error("PocketTUI: focus-change callbacks did not settle");
 }
 
 /** @internal Return a focused-component mapping without changing global defaults. */
@@ -73,6 +124,17 @@ export function dispatchTextInteraction(event: TuiInputEvent): boolean {
   return focusedTextInteraction()?.handleInput(event) ?? false;
 }
 
+/** @internal Feed the laid-out text viewport back to the focused input. */
+export function syncInteractionLayout(host: PocketTuiHost): boolean {
+  let changed = false;
+  for (const interaction of textInteractions.values()) {
+    const rect = host.nodeRect(interaction.cursorNode.id);
+    if (rect === undefined || rect.width <= 0 || rect.height <= 0) continue;
+    changed = interaction.updateViewport(rect.width, rect.height) || changed;
+  }
+  return changed;
+}
+
 /** @internal Anchor the real terminal cursor after the latest layout pass. */
 export function syncInteractionCursor(host: PocketTuiHost): void {
   const interaction = focusedTextInteraction();
@@ -93,12 +155,30 @@ export function syncInteractionCursor(host: PocketTuiHost): void {
   cursorOwned = true;
 }
 
+/** @internal Let a focused TextInput reclaim the cursor after a manual override. */
+export function invalidateInteractionCursor(): void {
+  lastCursorKey = "";
+}
+
 /** @internal Release cursor ownership when a session closes. */
 export function releaseInteractionCursor(host: PocketTuiHost): void {
-  if (cursorOwned) publishCursor(host, { row: 0, column: 0, visible: false });
-  cursorOwned = false;
-  lastCursorKey = "";
-  pasteInteraction = undefined;
+  try {
+    if (cursorOwned) publishCursor(host, { row: 0, column: 0, visible: false });
+  } finally {
+    textInteractions.clear();
+    buttonInteractions.clear();
+    focusListeners.clear();
+    cursorOwned = false;
+    lastCursorKey = "";
+    pasteInteraction = undefined;
+    syncedFocus = null;
+  }
+}
+
+function notifyFocus(node: NodeMirror, focused: boolean): void {
+  const listeners = focusListeners.get(node);
+  if (listeners === undefined) return;
+  for (const listener of [...listeners]) listener(focused);
 }
 
 function focusedTextInteraction(): TextInteraction | undefined {

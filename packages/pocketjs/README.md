@@ -60,46 +60,70 @@ a second terminal-only focus tree. `focusNode`, `getFocused`, focus scopes, and
 focus grids operate on the same mirror nodes that drive `HostOps.setFocus`,
 focus/active style variants, detach repair, and CIRCLE presses.
 
-`Button`, `Checkbox`, and `TextInput` are small headless components built on
-that path. They do not require JSX or a second renderer:
+`View` and `Text` are retained reactive primitives. `Button`, `Checkbox`, and
+`TextInput` are small headless components built on the same path. They do not
+require JSX or a second renderer:
 
 ```ts
 import {
   Button,
+  Text,
   TextInput,
-  createElement,
+  View,
   createSignal,
-  insertNode,
 } from "@pocket-tui/pocketjs";
 
 function App() {
   const [query, setQuery] = createSignal("");
-  const root = createElement("view");
-  insertNode(root, TextInput({
+  const input = TextInput({
     value: query,
     onValueChange: setQuery,
     onSubmit: (value) => console.log(value),
     placeholder: "Search",
-  }));
-  insertNode(root, Button({
-    label: () => `Open ${query()}`,
-    onPress: () => console.log(query()),
-  }));
-  return root;
+  });
+  return View({
+    children: [
+      Text({ value: () => `Query: ${query() || "none"}` }),
+      input,
+      Button({
+        label: () => `Open ${query()}`,
+        onPress: () => console.log(query()),
+      }),
+    ],
+  });
 }
 ```
 
-Text input consumes UTF-8 text, bracketed paste chunks, Enter, editing arrows,
-and grapheme-aware Backspace only while it is focused. It anchors the real
-terminal bar cursor to its laid-out text node. `onInput` still runs first and
-can consume an event before a component sees it. With the default mapper,
-Enter on a focused `Button` becomes Pocket CIRCLE so active/release state and
-`onPress` use the ordinary Pocket lifecycle; elsewhere Enter retains its
-existing START mapping. A custom `mapInput` remains a complete replacement.
+Text input consumes UTF-8 text, bracketed paste chunks, Enter, Left/Right,
+Home/End/Delete, and grapheme-aware Backspace only while it is focused.
+Single-line input follows the caret horizontally by display-cell width;
+multiline input windows wrapped rows vertically around it. The real terminal
+bar cursor anchors to the final laid-out text node. `setCaret()` wakes
+an adaptive session. `onInput` still runs first and can consume an event before
+a component sees it. With the default mapper, Enter on a focused `Button`
+becomes Pocket CIRCLE so active/release state and `onPress` use the ordinary
+Pocket lifecycle; elsewhere Enter retains its existing START mapping. Tab and
+Shift-Tab traverse Pocket focus. A custom `mapInput` remains a complete
+replacement.
+
+Native printable text is chunked for efficiency. `textEventPolicy: "batch"`
+preserves those chunks and remains the compatibility default;
+`textEventPolicy: "grapheme"` routes each grapheme through `onInput`, focused
+`TextInput`, and `mapInput` in order. Command-oriented applications such as
+Pocket Tasks use the latter so a coalesced `x3` behaves like two ordered keys,
+while bracketed paste chunks remain intact.
 
 The component defaults cover only cell geometry. Supply an inline style or a
 loaded PocketJS class for visual design; this keeps class `focus:` and
-`active:` variants free to override paint properties.
+`active:` variants free to override paint properties. `onFocusChange` is a
+reactive bridge for inline styling. Because HostOps style updates have no
+property-unset operation, return complete base and focused values for every
+inline key that changes rather than a sparse focus-only object. The same rule
+applies to `TextInput`: every key introduced by `placeholderStyle` needs an
+explicit normal value in `textStyle` so leaving the placeholder can restore it.
+Editable text pins left alignment, unit line height, zero tracking, column Flex,
+stretch alignment, and hidden overflow after custom styles; those metrics keep
+the horizontal viewport and terminal cursor cell-exact.
 
 ## Retained rendering behavior
 
@@ -184,10 +208,11 @@ tracking. Known unsupported pixel-oriented properties increment diagnostics.
 - A mapper may return one button mask or a bounded sequence of up to eight.
   The default mapper preserves recognized characters from a batched terminal
   text event, so inputs such as `.q` do not silently lose the quit command.
-- The default map covers arrows/WASD/HJKL, Space/P, `.`, R/Enter,
-  Q/Escape/Ctrl-C, and Backspace. Focused components may consume text/editing
-  events or specialize Enter as described above. Supply `mapInput` to replace
-  button mapping or `onInput` to inspect and consume events first.
+- The default map covers arrows/WASD/HJKL, Tab/Shift-Tab, Space/P, `.`,
+  R/Enter, Q/Escape/Ctrl-C, and Backspace. Focused components may consume
+  text/editing events or specialize Enter as described above. Home, End,
+  Delete, Page Up, and Page Down remain typed terminal events available to
+  components or `onInput`. Supply `mapInput` to replace button mapping.
 
 The optional effect bus is a PocketTUI surface extension, not part of PocketJS
 HostOps. Configure `tui.effectBus`, then use `session.setEffectBus(frame)` and
@@ -235,3 +260,11 @@ The executable adapter currently requires Bun because PocketJS 0.6's npm
 artifact publishes TypeScript source. Runtime calls always execute that pinned
 package. Local declarations pin the 0.6 contract so the dependency's shipped
 TypeScript sources do not inherit this workspace's stricter compiler settings.
+
+The facade does not currently expose upstream keyed `<For>` as a supported
+dynamic collection API. Under Bun's default Node export condition, PocketJS
+0.6's universal reconciler binds to Solid's server runtime while facade signals
+use the interactive client runtime; mixing them does not reconcile or dispose
+correctly. Use stable retained slots for bounded visible collections, as in
+[`examples/todo-list`](../../examples/todo-list), until one client-owned keyed
+reconciliation surface is available.

@@ -14,14 +14,14 @@
         "@pocket-tui/core": "workspace:*",
       },
     },
-    "examples/roguelike": {
-      "name": "@pocket-tui/example-roguelike",
+    "examples/rule-shift": {
+      "name": "@pocket-tui/example-rule-shift",
       "dependencies": {
         "@pocket-tui/pocketjs": "workspace:*",
       },
     },
-    "examples/rule-shift": {
-      "name": "@pocket-tui/example-rule-shift",
+    "examples/todo-list": {
+      "name": "@pocket-tui/example-todo-list",
       "dependencies": {
         "@pocket-tui/pocketjs": "workspace:*",
       },
@@ -71,9 +71,9 @@
 
     "@pocket-tui/example-basic": ["@pocket-tui/example-basic@workspace:examples/basic"],
 
-    "@pocket-tui/example-roguelike": ["@pocket-tui/example-roguelike@workspace:examples/roguelike"],
-
     "@pocket-tui/example-rule-shift": ["@pocket-tui/example-rule-shift@workspace:examples/rule-shift"],
+
+    "@pocket-tui/example-todo-list": ["@pocket-tui/example-todo-list@workspace:examples/todo-list"],
 
     "@pocket-tui/pocketjs": ["@pocket-tui/pocketjs@workspace:packages/pocketjs"],
 

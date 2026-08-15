@@ -47,7 +47,7 @@ JS retained shadow tree → cached cell layout → retained paint/row index
 PocketTUI Canvas → full/whole-row PTX1 → Rust row damage → ANSI terminal transition
 ```
 
-因此 retained demo **RULE//SHIFT** 与 **Signal Below** 都不是游戏代码直接绘制 Canvas。游戏只更新 retained PocketJS view/text nodes；`@pocket-tui/pocketjs` 的内部 surface 才创建 Canvas 并提交 frame。这个 reference backend 在 clean frame 跳过 layout/raster，并已提供由 native input/resize readiness、retained mutation 与 frame lease 驱动的 opt-in adaptive scheduler。纯 paint mutation 会复用上次 cell geometry 与 flattened text；absolute-positioned island 内的 geometry/text mutation 会以 cached parent 为边界，用同一 solver 只重排最近的 isolated subtree；其余 Flex 变化从 root 运行带精确 revision/constraint cache 的同一 solver，跳过 clean measurement 与同尺寸 subtree。full frame 从递归 raster oracle 构建 retained paint index；普通增量帧只替换受影响子树，并通过 sparse segment-row index 选择 dirty-row raster 与 hit-test candidates，不再遍历整棵 Host scene。paint membership 或 z/document order 改变时仍会重建全局顺序。首帧、resize、tree、style reference/table、interaction 与 forced frame 继续保留 full oracle。增量 surface 提交还携带精确 dirty rows：当 native 宣告支持且对齐后的记录更小时，core 发送带 Canvas base revision 的整行 PTX replacement；首帧、resize、dense change 与旧 native 自动回退完整 frame。Rust 下游继续把实际 terminal 输出限制到最终 damage。当前仍未实现 native typed-dirty layout 与完整 widget/compiler 系统；cached Flex 仍扫描直接 siblings，JavaScript 仍保留完整 semantic `CanvasFrame`，row compaction 与 PTX byte selection 也仍扫描完整 run set。
+因此 retained demo **Pocket Tasks** 与 **RULE//SHIFT** 都不是应用代码直接绘制 Canvas。应用只更新 retained PocketJS view/text nodes；`@pocket-tui/pocketjs` 的内部 surface 才创建 Canvas 并提交 frame。这个 reference backend 在 clean frame 跳过 layout/raster，并已提供由 native input/resize readiness、retained mutation 与 frame lease 驱动的 opt-in adaptive scheduler。纯 paint mutation 会复用上次 cell geometry 与 flattened text；absolute-positioned island 内的 geometry/text mutation 会以 cached parent 为边界，用同一 solver 只重排最近的 isolated subtree；其余 Flex 变化从 root 运行带精确 revision/constraint cache 的同一 solver，跳过 clean measurement 与同尺寸 subtree。full frame 从递归 raster oracle 构建 retained paint index；普通增量帧只替换受影响子树，并通过 sparse segment-row index 选择 dirty-row raster 与 hit-test candidates，不再遍历整棵 Host scene。paint membership 或 z/document order 改变时仍会重建全局顺序。首帧、resize、tree、style reference/table、interaction 与 forced frame 继续保留 full oracle。增量 surface 提交还携带精确 dirty rows：当 native 宣告支持且对齐后的记录更小时，core 发送带 Canvas base revision 的整行 PTX replacement；首帧、resize、dense change 与旧 native 自动回退完整 frame。Rust 下游继续把实际 terminal 输出限制到最终 damage。当前仍未实现 native typed-dirty layout 与完整 widget/compiler 系统；cached Flex 仍扫描直接 siblings，JavaScript 仍保留完整 semantic `CanvasFrame`，row compaction 与 PTX byte selection 也仍扫描完整 run set。
 
 PocketJS session 的 fixed compatibility policy 以 Pocket 虚拟时钟的精确因数频率运行（1/2/3/4/5/6/10/12/15/20/30/60 FPS，默认 30）；adaptive policy 把同一数值作为最大 cadence，在静态时暂停虚拟时钟。terminal key 被建模为 press frame + release frame；pending pulse 上限为 8。实时应用默认使用 latest-direction-wins coalescing，回合制应用可显式选择 bounded ordered direction queue。PocketJS 0.6 renderer 是进程全局状态，因此 adapter 显式限制为每进程一个 active session。颜色默认明确降级为 ANSI16，truecolor 是显式选择；没有主动 capability probe。texture/image/sprite/font atlas/timed animation 等 pixel-oriented 能力都有可观测的占位或 endpoint fallback，而不是宣称完整支持。
 
@@ -1097,7 +1097,7 @@ pocket-tui/
     pocket-tui-napi/      current PTX decoder and Node/Bun binding
   examples/
     basic/                imperative transcript vertical slice
-    roguelike/            PocketJS retained-backend flagship demo
+    todo-list/            PocketJS + Solid-style retained todo application
     rule-shift/           PocketJS retained rule-rewriting puzzle campaign
 ```
 

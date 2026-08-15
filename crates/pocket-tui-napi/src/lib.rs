@@ -287,7 +287,7 @@ impl From<InputEvent> for NativeInputEvent {
                 key: Some(key_name(event.code)),
                 ctrl: Some(event.modifiers.contains(KeyModifiers::CTRL)),
                 alt: Some(false),
-                shift: Some(false),
+                shift: Some(event.modifiers.contains(KeyModifiers::SHIFT)),
                 columns: None,
                 rows: None,
             },
@@ -334,13 +334,58 @@ impl NativeInputEvent {
 fn key_name(code: KeyCode) -> String {
     match code {
         KeyCode::Char(character) => character.to_string(),
+        KeyCode::Tab => "tab".to_owned(),
         KeyCode::Enter => "enter".to_owned(),
         KeyCode::Backspace => "backspace".to_owned(),
+        KeyCode::Delete => "delete".to_owned(),
         KeyCode::Escape => "escape".to_owned(),
+        KeyCode::Home => "home".to_owned(),
+        KeyCode::End => "end".to_owned(),
+        KeyCode::PageUp => "page-up".to_owned(),
+        KeyCode::PageDown => "page-down".to_owned(),
         KeyCode::ArrowUp => "arrow-up".to_owned(),
         KeyCode::ArrowDown => "arrow-down".to_owned(),
         KeyCode::ArrowLeft => "arrow-left".to_owned(),
         KeyCode::ArrowRight => "arrow-right".to_owned(),
         KeyCode::UnknownEscape => "unknown-escape".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pocket_tui_terminal::KeyEvent;
+
+    use super::*;
+
+    #[test]
+    fn native_key_names_and_shift_modifier_are_stable() {
+        let cases = [
+            (KeyCode::Tab, "tab"),
+            (KeyCode::Home, "home"),
+            (KeyCode::End, "end"),
+            (KeyCode::Delete, "delete"),
+            (KeyCode::PageUp, "page-up"),
+            (KeyCode::PageDown, "page-down"),
+        ];
+        for (code, expected) in cases {
+            let event = NativeInputEvent::from(InputEvent::Key(KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert_eq!(event.kind, "key");
+            assert_eq!(event.key.as_deref(), Some(expected));
+            assert_eq!(event.ctrl, Some(false));
+            assert_eq!(event.alt, Some(false));
+            assert_eq!(event.shift, Some(false));
+        }
+
+        let backtab = NativeInputEvent::from(InputEvent::Key(KeyEvent {
+            code: KeyCode::Tab,
+            modifiers: KeyModifiers::SHIFT,
+        }));
+        assert_eq!(backtab.key.as_deref(), Some("tab"));
+        assert_eq!(backtab.ctrl, Some(false));
+        assert_eq!(backtab.alt, Some(false));
+        assert_eq!(backtab.shift, Some(true));
     }
 }

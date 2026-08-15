@@ -3,11 +3,11 @@
 use std::io;
 use std::os::fd::RawFd;
 
-const ENTER_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[0m";
+const ENTER_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?2004h\x1b[?25l\x1b[0m";
 const RESET_CURSOR_COLOR: &[u8] = b"\x1b]112\x1b\\";
 const RESET_EFFECT_BUS: &[u8] = b"\x1b]104;240;241;242;243\x1b\\";
 const RESET_CURSOR_SHAPE: &[u8] = b"\x1b[0 q";
-const LEAVE_ALTERNATE_SCREEN: &[u8] = b"\x1b[?25h\x1b[?1049l";
+const LEAVE_ALTERNATE_SCREEN: &[u8] = b"\x1b[?2004l\x1b[?25h\x1b[?1049l";
 
 /// Restores Unix terminal modes, cursor visibility, and the main screen on drop.
 ///
@@ -52,6 +52,10 @@ impl TerminalGuard {
         }
 
         if let Err(error) = write_all_fd(output_fd, ENTER_ALTERNATE_SCREEN) {
+            // The write may have stopped after enabling one or more modes.
+            // Always attempt the same restoration sequence used by an owned
+            // guard before returning the original causal error.
+            let _ = write_all_fd(output_fd, &restoration_bytes(false, false, false));
             // SAFETY: best-effort rollback using the saved, initialized state.
             unsafe {
                 libc::tcsetattr(input_fd, libc::TCSAFLUSH, &original);
@@ -183,21 +187,33 @@ fn restoration_bytes(reset_color: bool, reset_shape: bool, reset_effect_bus: boo
 
 #[cfg(test)]
 mod tests {
-    use super::restoration_bytes;
+    use super::{ENTER_ALTERNATE_SCREEN, restoration_bytes};
+
+    #[test]
+    fn terminal_mode_sequences_pair_bracketed_paste_enable_and_disable() {
+        assert_eq!(
+            ENTER_ALTERNATE_SCREEN,
+            b"\x1b[?1049h\x1b[?2004h\x1b[?25l\x1b[0m"
+        );
+        assert_eq!(
+            restoration_bytes(false, false, false),
+            b"\x1b[0m\x1b[?2004l\x1b[?25h\x1b[?1049l"
+        );
+    }
 
     #[test]
     fn cursor_resets_are_emitted_only_after_an_override() {
         assert_eq!(
             restoration_bytes(false, false, false),
-            b"\x1b[0m\x1b[?25h\x1b[?1049l"
+            b"\x1b[0m\x1b[?2004l\x1b[?25h\x1b[?1049l"
         );
         assert_eq!(
             restoration_bytes(true, true, false),
-            b"\x1b[0m\x1b]112\x1b\\\x1b[0 q\x1b[?25h\x1b[?1049l"
+            b"\x1b[0m\x1b]112\x1b\\\x1b[0 q\x1b[?2004l\x1b[?25h\x1b[?1049l"
         );
         assert_eq!(
             restoration_bytes(true, true, true),
-            b"\x1b[0m\x1b]104;240;241;242;243\x1b\\\x1b]112\x1b\\\x1b[0 q\x1b[?25h\x1b[?1049l"
+            b"\x1b[0m\x1b]104;240;241;242;243\x1b\\\x1b]112\x1b\\\x1b[0 q\x1b[?2004l\x1b[?25h\x1b[?1049l"
         );
     }
 }

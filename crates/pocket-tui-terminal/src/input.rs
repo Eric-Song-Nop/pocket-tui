@@ -17,6 +17,7 @@ pub struct KeyModifiers(u8);
 impl KeyModifiers {
     pub const NONE: Self = Self(0);
     pub const CTRL: Self = Self(1 << 0);
+    pub const SHIFT: Self = Self(1 << 1);
 
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
@@ -28,9 +29,15 @@ impl KeyModifiers {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeyCode {
     Char(char),
+    Tab,
     Enter,
     Backspace,
+    Delete,
     Escape,
+    Home,
+    End,
+    PageUp,
+    PageDown,
     ArrowUp,
     ArrowDown,
     ArrowLeft,
@@ -38,6 +45,29 @@ pub enum KeyCode {
     /// A complete escape sequence not yet modeled by the typed MVP parser.
     UnknownEscape,
 }
+
+const KEY_SEQUENCES: &[(&[u8], KeyCode, KeyModifiers)] = &[
+    (b"\x1b[A", KeyCode::ArrowUp, KeyModifiers::NONE),
+    (b"\x1b[B", KeyCode::ArrowDown, KeyModifiers::NONE),
+    (b"\x1b[C", KeyCode::ArrowRight, KeyModifiers::NONE),
+    (b"\x1b[D", KeyCode::ArrowLeft, KeyModifiers::NONE),
+    (b"\x1bOA", KeyCode::ArrowUp, KeyModifiers::NONE),
+    (b"\x1bOB", KeyCode::ArrowDown, KeyModifiers::NONE),
+    (b"\x1bOC", KeyCode::ArrowRight, KeyModifiers::NONE),
+    (b"\x1bOD", KeyCode::ArrowLeft, KeyModifiers::NONE),
+    (b"\x1b[H", KeyCode::Home, KeyModifiers::NONE),
+    (b"\x1bOH", KeyCode::Home, KeyModifiers::NONE),
+    (b"\x1b[1~", KeyCode::Home, KeyModifiers::NONE),
+    (b"\x1b[7~", KeyCode::Home, KeyModifiers::NONE),
+    (b"\x1b[F", KeyCode::End, KeyModifiers::NONE),
+    (b"\x1bOF", KeyCode::End, KeyModifiers::NONE),
+    (b"\x1b[4~", KeyCode::End, KeyModifiers::NONE),
+    (b"\x1b[8~", KeyCode::End, KeyModifiers::NONE),
+    (b"\x1b[3~", KeyCode::Delete, KeyModifiers::NONE),
+    (b"\x1b[5~", KeyCode::PageUp, KeyModifiers::NONE),
+    (b"\x1b[6~", KeyCode::PageDown, KeyModifiers::NONE),
+    (b"\x1b[Z", KeyCode::Tab, KeyModifiers::SHIFT),
+];
 
 /// One decoded key occurrence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,6 +208,10 @@ impl InputParser {
                     self.buffer.drain(..consume);
                     events.push(key(KeyCode::Enter, KeyModifiers::NONE));
                 }
+                b'\t' => {
+                    self.buffer.remove(0);
+                    events.push(key(KeyCode::Tab, KeyModifiers::NONE));
+                }
                 0x08 | 0x7f => {
                     self.buffer.remove(0);
                     events.push(key(KeyCode::Backspace, KeyModifiers::NONE));
@@ -208,15 +242,10 @@ impl InputParser {
     }
 
     fn parse_escape(&mut self, events: &mut Vec<InputEvent>) -> bool {
-        for (sequence, code) in [
-            (b"\x1b[A".as_slice(), KeyCode::ArrowUp),
-            (b"\x1b[B".as_slice(), KeyCode::ArrowDown),
-            (b"\x1b[C".as_slice(), KeyCode::ArrowRight),
-            (b"\x1b[D".as_slice(), KeyCode::ArrowLeft),
-        ] {
+        for &(sequence, code, modifiers) in KEY_SEQUENCES {
             if self.buffer.starts_with(sequence) {
                 self.buffer.drain(..sequence.len());
-                events.push(key(code, KeyModifiers::NONE));
+                events.push(key(code, modifiers));
                 return true;
             }
         }
@@ -227,16 +256,10 @@ impl InputParser {
             return true;
         }
 
-        let known = [
-            b"\x1b[A".as_slice(),
-            b"\x1b[B".as_slice(),
-            b"\x1b[C".as_slice(),
-            b"\x1b[D".as_slice(),
-            PASTE_START,
-        ];
-        if known
+        if KEY_SEQUENCES
             .iter()
-            .any(|sequence| sequence.starts_with(&self.buffer))
+            .any(|(sequence, _, _)| sequence.starts_with(&self.buffer))
+            || PASTE_START.starts_with(&self.buffer)
         {
             return false;
         }
@@ -551,6 +574,43 @@ mod tests {
             parser.feed(b"\x1b[1;2A").unwrap(),
             vec![key(KeyCode::UnknownEscape, KeyModifiers::NONE)]
         );
+    }
+
+    #[test]
+    fn decodes_common_navigation_editing_and_focus_sequences_across_boundaries() {
+        let cases: &[(&[u8], KeyCode, KeyModifiers)] = &[
+            (b"\t", KeyCode::Tab, KeyModifiers::NONE),
+            (b"\x1b[Z", KeyCode::Tab, KeyModifiers::SHIFT),
+            (b"\x1b[H", KeyCode::Home, KeyModifiers::NONE),
+            (b"\x1bOH", KeyCode::Home, KeyModifiers::NONE),
+            (b"\x1b[1~", KeyCode::Home, KeyModifiers::NONE),
+            (b"\x1b[7~", KeyCode::Home, KeyModifiers::NONE),
+            (b"\x1b[F", KeyCode::End, KeyModifiers::NONE),
+            (b"\x1bOF", KeyCode::End, KeyModifiers::NONE),
+            (b"\x1b[4~", KeyCode::End, KeyModifiers::NONE),
+            (b"\x1b[8~", KeyCode::End, KeyModifiers::NONE),
+            (b"\x1b[3~", KeyCode::Delete, KeyModifiers::NONE),
+            (b"\x1b[5~", KeyCode::PageUp, KeyModifiers::NONE),
+            (b"\x1b[6~", KeyCode::PageDown, KeyModifiers::NONE),
+            (b"\x1bOA", KeyCode::ArrowUp, KeyModifiers::NONE),
+            (b"\x1bOB", KeyCode::ArrowDown, KeyModifiers::NONE),
+            (b"\x1bOC", KeyCode::ArrowRight, KeyModifiers::NONE),
+            (b"\x1bOD", KeyCode::ArrowLeft, KeyModifiers::NONE),
+        ];
+
+        for &(sequence, code, modifiers) in cases {
+            let mut parser = InputParser::default();
+            let mut events = Vec::new();
+            for byte in sequence {
+                events.extend(parser.feed(&[*byte]).unwrap());
+            }
+            assert_eq!(
+                events,
+                vec![key(code, modifiers)],
+                "failed to decode {sequence:?}"
+            );
+            assert_eq!(parser.pending_bytes(), 0);
+        }
     }
 
     #[test]
