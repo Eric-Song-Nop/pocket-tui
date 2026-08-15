@@ -5,11 +5,12 @@ PocketTUI. It lets PocketJS keep ownership of component state and lifecycle
 while PocketTUI owns the terminal surface, native scene, damage tracking, and
 ANSI output.
 
-This is the backend used by the **RULE//SHIFT** rule-rewriting puzzle campaign
-and the **Signal Below** roguelike. Neither game imports `CellBuffer`, creates a
-PocketTUI `Canvas`, or writes ANSI. Their application layers create retained
-PocketJS text and view nodes. Canvas is an internal boundary used by the
-backend after those nodes have been laid out and rasterized.
+This is the backend used by the **Pocket Tasks** Solid-style todo list and the
+**RULE//SHIFT** rule-rewriting puzzle campaign. Neither application imports
+`CellBuffer`, creates a PocketTUI `Canvas`, or writes ANSI. Their application
+layers create retained PocketJS text and view nodes. Canvas is an internal
+boundary used by the backend after those nodes have been laid out and
+rasterized.
 
 ## Data path
 
@@ -89,8 +90,9 @@ The backend implements PocketJS `view`, `text`, and `image` nodes with:
 - parent/child ordering, detach, move, recursive destroy, focus, active state,
   and paint-order hit testing;
 - PocketJS document-order focus traversal, focus scopes/grids, detach repair,
-  active press state, and small headless `Button`, `Checkbox`, and `TextInput`
-  components;
+  active press state, observable focus-change notifications, reactive `View`
+  and `Text` primitives, and small headless `Button`, `Checkbox`, and
+  `TextInput` components;
 - PocketJS v2 style tables with base, focus, and active variants;
 - cell flex rows and columns, grow/shrink/basis, min/max dimensions, gap,
   padding, margin, absolute positioning, clipping, display, and z-order;
@@ -113,13 +115,13 @@ diagnostics rather than silently presented as supported.
 
 There is no active terminal color probe in this backend. If
 `POCKET_TUI_GHOSTTY_EFFECTS=1` is present, the default changes to `truecolor`;
-an explicit `colorMode` always makes the choice clearer. Signal Below sets the
-mode explicitly: ordinary terminals use ANSI16 and its Ghostty launcher opts
-into truecolor.
+an explicit `colorMode` always makes the choice clearer. Pocket Tasks selects
+ANSI16 explicitly, while RULE//SHIFT's optional Ghostty launcher selects
+truecolor.
 
 Ghostty's effect bus is separate from color conversion and separate from
 PocketJS `HostOps`. It is an optional, typed PocketTUI surface channel. A normal
-terminal receives the complete cell-rendered game without it.
+terminal receives the complete cell-rendered application without it.
 
 ## Input and frame contract
 
@@ -145,6 +147,13 @@ the parser-owned standalone-Escape deadline and checks the authoritative output
 tty's viewport every 250 ms. An unchanged viewport only rearms the native
 deadline; JavaScript wakes when dimensions actually change. A custom surface
 without readiness falls back to `idlePollMs` (1000 ms by default).
+
+Entering the terminal surface enables bracketed paste (`CSI ?2004 h`), and
+every normal, failed-enter, or drop restoration path disables it before
+restoring terminal modes. The incremental parser exposes stable names for
+arrows, Tab/Shift-Tab, Home, End, Delete, Page Up, Page Down, Enter, Backspace,
+and Escape while preserving unknown modified escape sequences as explicit
+unknown events.
 
 Public `onFrame` and `createSpriteAnimation` registrations hold a continuous
 adaptive lease. The facade's deterministic `after()` holds a lease through its
@@ -183,15 +192,26 @@ The default mapper turns every recognized character in one batched terminal
 text event into a pulse before applying the queue policy; a later quit or
 action character is therefore not hidden by an earlier movement character.
 
-The default mapper covers arrows, WASD/HJKL, Space/P, `.`, R/Enter,
-Q/Escape/Ctrl-C, and Backspace. A focused `Button` specializes Enter to CIRCLE
+The default mapper covers arrows/WASD/HJKL, Tab/Shift-Tab, Space/P, `.`,
+R/Enter, Q/Escape/Ctrl-C, and Backspace. Tab and Shift-Tab traverse Pocket
+focus forward and backward. A focused `Button` specializes Enter to CIRCLE
 without changing Enter's START mapping elsewhere. A focused `TextInput`
-consumes text, paste chunks, editing keys, and submit before button mapping,
-and anchors the real terminal cursor after layout. Applications can replace
-button mapping with `mapInput` or inspect and consume events first with
-`onInput`. Each resize event synchronizes the Host viewport and both
-Pocket-owned root layers before that event's application callback runs; all
-queued resize events are applied before frame dispatch.
+consumes text, paste chunks, Left/Right/Home/End/Delete/Backspace, and submit
+before button mapping. Its grapheme-aware single-line viewport follows the
+caret horizontally, while multiline input windows wrapped rows vertically;
+both anchor the real terminal cursor after layout. Applications can
+replace button mapping with `mapInput` or inspect and consume events first with
+`onInput`; Page Up/Page Down are available there as typed keys. Each resize
+event synchronizes the Host viewport and both Pocket-owned root layers before
+that event's application callback runs; all queued resize events are applied
+before frame dispatch.
+
+Printable text remains batched by default. Applications that interpret text as
+ordered commands can select `textEventPolicy: "grapheme"`; the session then
+routes each grapheme through `onInput`, focused text interaction, and button
+mapping in order while preserving the original native batch in `step().events`.
+Pocket Tasks uses this policy so coalesced shortcuts and a shortcut that moves
+focus into the composer retain per-key semantics. Paste chunks are not split.
 
 For deterministic tests or external scheduling, call `session.step()` directly
 instead of `session.run()`. Steps are single-flight and cannot overlap the run
@@ -223,15 +243,13 @@ Pixel-oriented PocketJS operations have bounded terminal fallbacks:
 | Font atlas | Ignores the atlas | `ignoredFontAtlases` |
 | Known unsupported style | Stores but does not paint the property | `unsupportedProperties` |
 
-`session.diagnostics` also reports live nodes, HostOps mutations, rendered and
+`session.diagnostics` reports live nodes, HostOps mutations, rendered and
 skipped frames, full/cached/localized/reused layout frames,
 recomputed/measured/reused layout nodes, relayout roots, full and incremental
 raster frames, full/incremental/reused paint-index frames, rebuilt index
 nodes/roots, global paint-order rebuilds, raster candidates, last/total
 repainted rows, the latest compact run count, missing style references,
 `framePolicy`, `steppedFrames`, `idleWaits`, and `wakeSignals`.
-Signal Below exposes a small `HOST LINK` sample of these counters in its
-receiver rail so the retained backend is observable while playing.
 
 ## Mounting a PocketJS application
 
@@ -259,6 +277,14 @@ workspace's compiler settings. The executable adapter currently requires Bun:
 PocketJS 0.6 publishes TypeScript source in its npm artifact, which ordinary
 Node does not execute from `node_modules`.
 
+The facade deliberately does not expose upstream keyed `<For>` as a supported
+collection surface. Under Bun's default Node export condition, PocketJS 0.6's
+published universal renderer resolves that reconciler against Solid's server
+runtime, so mixing it with facade-owned client signals would neither reconcile
+nor clean up correctly. Pocket Tasks uses a stable retained row pool over an
+unbounded model until the upstream runtime surface can provide a single client
+reconciliation graph.
+
 ## Build and run the demos
 
 From the repository root:
@@ -268,24 +294,17 @@ bun install
 bun run build
 ```
 
-Run the ANSI16 base game in the current terminal:
+Run the PocketJS + Solid-style todo list in the current terminal:
 
 ```bash
-cd examples/roguelike
+cd examples/todo-list
 bun run start
 ```
 
-Or open a fresh Ghostty surface with truecolor and the optional shader channel:
-
-```bash
-cd examples/roguelike
-bun run ghostty
-```
-
-The launcher requires Ghostty 1.3 or newer and does not edit global Ghostty
-configuration. See the [Signal Below README](../examples/roguelike/README.md)
-for controls and its [dedicated Ghostty document](../examples/roguelike/GHOSTTY.md)
-for shader-specific details.
+Pocket Tasks exercises retained `View`/`Text` nodes, focus, `TextInput`,
+filtering, responsive cell layout, and stable visible-list slots without
+crossing the application's HostOps boundary. See its
+[README](../examples/todo-list/README.md) for controls and design rationale.
 
 The rule-puzzle campaign exercises the same HostOps path with a deterministic
 word-rule engine, stable retained node pools, immediate rule recomputation,

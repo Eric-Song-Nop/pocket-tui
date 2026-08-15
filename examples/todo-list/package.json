@@ -1,0 +1,12 @@
+{
+  "name": "@pocket-tui/example-todo-list",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun src/main.ts",
+    "test": "bun test src/todo-model.test.ts src/backend-smoke.test.ts"
+  },
+  "dependencies": {
+    "@pocket-tui/pocketjs": "workspace:*"
+  }
+}

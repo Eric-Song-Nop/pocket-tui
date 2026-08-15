@@ -10,13 +10,17 @@ export type { PocketTuiColorMode } from "./raster.js";
 export {
   Button,
   Checkbox,
+  Text,
   TextInput,
+  View,
   type ButtonProps,
   type CheckboxProps,
   type PocketStyle,
   type ReactiveValue,
+  type TextProps,
   type TextInputHandle,
   type TextInputProps,
+  type ViewProps,
 } from "./components.js";
 export {
   POCKET_BUTTON,
@@ -28,6 +32,7 @@ export {
   type PocketInputMapping,
   type PocketInputMapper,
   type PocketTuiFramePolicy,
+  type PocketTextEventPolicy,
   type PocketTuiSessionDiagnostics,
   type PocketTuiSessionOptions,
   type PocketTuiStepResult,

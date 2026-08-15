@@ -23,9 +23,13 @@ import {
 import {
   dispatchTextInteraction,
   focusedInteractionMapping,
+  invalidateInteractionCursor,
   releaseInteractionCursor,
   syncInteractionCursor,
+  syncInteractionFocus,
+  syncInteractionLayout,
 } from "./interaction.js";
+import { graphemes } from "./unicode.js";
 
 export const POCKET_BUTTON = BTN;
 
@@ -33,6 +37,7 @@ export type PocketInputMapping = number | readonly number[];
 export type PocketInputMapper = (event: TuiInputEvent) => PocketInputMapping | undefined;
 export type PocketInputHandler = (event: TuiInputEvent, session: PocketTuiSession) => boolean | void;
 export type PocketTuiFramePolicy = "fixed" | "adaptive";
+export type PocketTextEventPolicy = "batch" | "grapheme";
 
 export interface PocketTuiSessionOptions extends PocketTuiHostOptions {
   /** Reuse a separately constructed host, primarily for custom surfaces. */
@@ -59,6 +64,11 @@ export interface PocketTuiSessionOptions extends PocketTuiHostOptions {
    * Default: `latest`.
    */
   directionPulsePolicy?: "latest" | "queue";
+  /**
+   * Preserve native text chunks, or route each grapheme through onInput,
+   * focused TextInput, and mapInput in order. Default: `batch`.
+   */
+  textEventPolicy?: PocketTextEventPolicy;
   /** Override the terminal-event to Pocket button-pulse mapping. */
   mapInput?: PocketInputMapper;
   /** Runs before mapInput; return true to consume an event. */
@@ -86,6 +96,7 @@ export class PocketTuiSession {
   readonly #framePolicy: PocketTuiFramePolicy;
   readonly #idlePollMs: number;
   readonly #directionPulsePolicy: "latest" | "queue";
+  readonly #textEventPolicy: PocketTextEventPolicy;
   readonly #mapInput: PocketInputMapper;
   readonly #usesDefaultInputMap: boolean;
   readonly #onInput?: PocketInputHandler;
@@ -127,6 +138,7 @@ export class PocketTuiSession {
     this.#directionPulsePolicy = validateDirectionPulsePolicy(
       options.directionPulsePolicy ?? "latest",
     );
+    this.#textEventPolicy = validateTextEventPolicy(options.textEventPolicy ?? "batch");
     this.#mapInput = options.mapInput ?? defaultPocketInputMap;
     this.#usesDefaultInputMap = options.mapInput === undefined;
     this.#onInput = options.onInput;
@@ -166,6 +178,7 @@ export class PocketTuiSession {
 
   setCursor(options: CursorPacketOptions): void {
     this.host.setCursor(options);
+    invalidateInteractionCursor();
   }
 
   setEffectBus(frame: EffectBusFrame): void {
@@ -202,29 +215,34 @@ export class PocketTuiSession {
     this.#throwInputDrainFailure();
     const events = this.#pendingInputEvents.splice(0);
     this.#pendingInputTextBytes = 0;
-    for (const event of events) {
-      if (event.kind === "resize") this.host.resize(event.columns, event.rows);
-      if (this.#onInput?.(event, this) === true) continue;
-      if (dispatchTextInteraction(event)) continue;
-      const mapping =
-        (this.#usesDefaultInputMap ? focusedInteractionMapping(event) : undefined) ??
-        this.#mapInput(event);
-      if (mapping === undefined) continue;
-      const mappedButtons = typeof mapping === "number" ? [mapping] : mapping;
-      if (mappedButtons.length > MAX_QUEUED_BUTTON_PULSES) {
-        throw new RangeError(
-          `PocketTUI: input mapper may return at most ${MAX_QUEUED_BUTTON_PULSES} button masks`,
-        );
-      }
-      for (const mapped of mappedButtons) {
-        if (!Number.isInteger(mapped) || mapped < 0 || mapped > 0xffff_ffff) {
-          throw new RangeError("PocketTUI: input mapper must return unsigned 32-bit button masks");
+    for (const nativeEvent of events) {
+      const routedEvents = this.#textEventPolicy === "grapheme" && nativeEvent.kind === "text"
+        ? graphemes(nativeEvent.text).map(({ text }) => ({ kind: "text", text }) as const)
+        : [nativeEvent];
+      for (const event of routedEvents) {
+        if (event.kind === "resize") this.host.resize(event.columns, event.rows);
+        if (this.#onInput?.(event, this) === true) continue;
+        if (dispatchTextInteraction(event)) continue;
+        const mapping =
+          (this.#usesDefaultInputMap ? focusedInteractionMapping(event) : undefined) ??
+          this.#mapInput(event);
+        if (mapping === undefined) continue;
+        const mappedButtons = typeof mapping === "number" ? [mapping] : mapping;
+        if (mappedButtons.length > MAX_QUEUED_BUTTON_PULSES) {
+          throw new RangeError(
+            `PocketTUI: input mapper may return at most ${MAX_QUEUED_BUTTON_PULSES} button masks`,
+          );
         }
-        if (mapped === 0) continue;
-        // Terminal input is edge-based rather than key-up/key-down based. Every
-        // pulse is followed by one release frame so Pocket's edge detector sees
-        // repeated keys as repeated presses.
-        this.#enqueueButtonPulse(mapped >>> 0);
+        for (const mapped of mappedButtons) {
+          if (!Number.isInteger(mapped) || mapped < 0 || mapped > 0xffff_ffff) {
+            throw new RangeError("PocketTUI: input mapper must return unsigned 32-bit button masks");
+          }
+          if (mapped === 0) continue;
+          // Terminal input is edge-based rather than key-up/key-down based. Every
+          // pulse is followed by one release frame so Pocket's edge detector sees
+          // repeated keys as repeated presses.
+          this.#enqueueButtonPulse(mapped >>> 0);
+        }
       }
     }
 
@@ -244,7 +262,9 @@ export class PocketTuiSession {
     __consumeFrameRequest();
     frameHandler(buttons, 0x8080);
     this.#steppedFrames += 1;
-    const frame = this.host.render();
+    syncInteractionFocus();
+    let frame = this.host.render();
+    if (syncInteractionLayout(this.host)) frame = this.host.render();
     syncInteractionCursor(this.host);
     if (this.host.surfacePending) await this.host.flush("terminal");
     return { events, buttons, frame };
@@ -607,13 +627,16 @@ export async function mountPocketTui(
   validateFramePolicy(options.framePolicy ?? "fixed");
   validateIdlePollMs(options.idlePollMs ?? DEFAULT_IDLE_POLL_MS);
   validateDirectionPulsePolicy(options.directionPulsePolicy ?? "latest");
+  validateTextEventPolicy(options.textEventPolicy ?? "batch");
   const releaseLease = acquirePocketRuntimeLease();
   let host: PocketTuiHost | undefined;
   let disposePocket: (() => void) | undefined;
   try {
     host = options.host ?? createPocketTuiHost(options);
     disposePocket = mountWithSimulationRate(code, { ...options.pocket, ops: host.ops }, fps);
+    syncInteractionFocus();
     host.render();
+    if (syncInteractionLayout(host)) host.render();
     syncInteractionCursor(host);
     await host.start();
     await host.flush("terminal");
@@ -623,6 +646,11 @@ export async function mountPocketTui(
       disposePocket?.();
     } catch {
       // Preserve the causal mount/start error.
+    }
+    try {
+      if (host !== undefined) releaseInteractionCursor(host);
+    } catch {
+      // Preserve the causal mount/start error; the reset runs in a finally block.
     }
     try {
       await host?.close();
@@ -640,6 +668,8 @@ export const defaultPocketInputMap: PocketInputMapper = (event) => {
   if (event.kind === "key") {
     if (event.ctrl && event.key.toLowerCase() === "c") return BTN.SELECT;
     switch (event.key) {
+      case "tab":
+        return event.shift ? BTN.UP : BTN.DOWN;
       case "arrow-up":
         return BTN.UP;
       case "arrow-right":
@@ -725,6 +755,13 @@ function validateFps(value: number): number {
 function validateDirectionPulsePolicy(value: unknown): "latest" | "queue" {
   if (value !== "latest" && value !== "queue") {
     throw new RangeError("PocketTUI: directionPulsePolicy must be one of latest, queue");
+  }
+  return value;
+}
+
+function validateTextEventPolicy(value: unknown): PocketTextEventPolicy {
+  if (value !== "batch" && value !== "grapheme") {
+    throw new RangeError("PocketTUI: textEventPolicy must be one of batch, grapheme");
   }
   return value;
 }
