@@ -9,6 +9,32 @@ interface Measured {
   height: number;
 }
 
+interface MeasurementBucket {
+  /** Snapshot, rather than a live node lookup, for transactional cache safety. */
+  readonly revision: number;
+  readonly values: ReadonlyMap<string, Measured>;
+}
+
+/** Opaque, immutable-by-convention state carried between successful frames. */
+export interface LayoutCache {
+  readonly measurements: ReadonlyMap<number, MeasurementBucket>;
+  readonly geometryRevisions: ReadonlyMap<number, number>;
+  readonly textRevisions: ReadonlyMap<number, number>;
+  readonly subtreeEntryCounts: ReadonlyMap<number, number>;
+}
+
+export interface LayoutPass {
+  readonly result: LayoutResult;
+  readonly cache: LayoutCache;
+  /** Entries whose layout function actually ran. */
+  readonly laidOutNodes: number;
+  /** Entries copied or retained from an exact geometry-cache hit. */
+  readonly reusedNodes: number;
+  /** Distinct nodes whose intrinsic measurement was computed. */
+  readonly measuredNodes: number;
+  readonly measurementCacheHits: number;
+}
+
 interface FlexItem {
   node: HostNode;
   style: ComputedStyle;
@@ -22,10 +48,21 @@ interface FlexItem {
 }
 
 interface LayoutEngine {
-  readonly layout: (node: HostNode, rect: Rect) => void;
-  readonly layoutAbsolute: (node: HostNode, inner: Rect) => void;
-  readonly result: () => LayoutResult;
+  readonly layout: (node: HostNode, rect: Rect) => number;
+  readonly layoutAbsolute: (node: HostNode, inner: Rect) => number;
+  readonly result: () => LayoutPass;
 }
+
+interface LayoutEngineOptions {
+  readonly previous?: LayoutResult;
+  readonly cache?: LayoutCache;
+  /** Full passes intentionally ignore old geometry while still using one solver. */
+  readonly reuseGeometry?: boolean;
+  /** Partial passes return only entries and text belonging to the requested root. */
+  readonly partial?: boolean;
+}
+
+const MAX_MEASUREMENTS_PER_NODE = 8;
 
 export function layoutTree(
   root: HostNode,
@@ -33,7 +70,39 @@ export function layoutTree(
   rows: number,
   resolveStyle: StyleResolver,
 ): LayoutResult {
+  return layoutTreeCached(root, columns, rows, resolveStyle).result;
+}
+
+/** Performs a full pass and returns the exact caches needed by later frames. */
+export function layoutTreeCached(
+  root: HostNode,
+  columns: number,
+  rows: number,
+  resolveStyle: StyleResolver,
+): LayoutPass {
   const engine = createLayoutEngine(resolveStyle);
+  engine.layout(root, { x: 0, y: 0, width: columns, height: rows });
+  return engine.result();
+}
+
+/**
+ * Re-runs the normal root solver but skips clean subtrees whose assigned size
+ * and retained revision still exactly match the last successfully presented
+ * frame. A changed position with the same size translates cached geometry.
+ */
+export function layoutTreeIncremental(
+  root: HostNode,
+  columns: number,
+  rows: number,
+  resolveStyle: StyleResolver,
+  previous: LayoutResult,
+  cache: LayoutCache,
+): LayoutPass {
+  const engine = createLayoutEngine(resolveStyle, {
+    previous,
+    cache,
+    reuseGeometry: true,
+  });
   engine.layout(root, { x: 0, y: 0, width: columns, height: rows });
   return engine.result();
 }
@@ -51,11 +120,31 @@ export function layoutAbsoluteSubtree(
   parent: LayoutEntry,
   resolveStyle: StyleResolver,
 ): LayoutResult {
+  return layoutAbsoluteSubtreeCached(root, parent, resolveStyle).result;
+}
+
+/**
+ * Cached form of {@link layoutAbsoluteSubtree}. The returned cache is a
+ * complete replacement for the input cache, while the returned LayoutResult
+ * remains a partial subtree result suitable for the host's existing merge.
+ */
+export function layoutAbsoluteSubtreeCached(
+  root: HostNode,
+  parent: LayoutEntry,
+  resolveStyle: StyleResolver,
+  previous?: LayoutResult,
+  cache?: LayoutCache,
+): LayoutPass {
   if (parent.node.type !== NODE.view) {
     throw new TypeError("absolute subtrees require a view parent");
   }
 
-  const engine = createLayoutEngine(resolveStyle);
+  const engine = createLayoutEngine(resolveStyle, {
+    previous,
+    cache,
+    reuseGeometry: previous !== undefined && cache !== undefined,
+    partial: true,
+  });
   const inner = innerRect(parent.rect, parent.style);
   const style = resolveStyle(root);
   if (style.display === ENUM.displayNone) {
@@ -69,24 +158,59 @@ export function layoutAbsoluteSubtree(
   return engine.result();
 }
 
-function createLayoutEngine(resolveStyle: StyleResolver): LayoutEngine {
-  const entries = new Map<number, LayoutEntry>();
-  const flattenedText = new Map<number, string>();
+function createLayoutEngine(resolveStyle: StyleResolver, options: LayoutEngineOptions = {}): LayoutEngine {
+  const entries = options.partial
+    ? new Map<number, LayoutEntry>()
+    : new Map<number, LayoutEntry>(options.previous?.entries);
+  const flattenedText = options.partial
+    ? new Map<number, string>()
+    : new Map<number, string>(options.previous?.flattenedText);
+  const measurements = new Map<number, MeasurementBucket>(options.cache?.measurements);
+  const geometryRevisions = new Map<number, number>(options.cache?.geometryRevisions);
+  const textRevisions = new Map<number, number>(options.cache?.textRevisions);
+  const subtreeEntryCounts = new Map<number, number>(options.cache?.subtreeEntryCounts);
+  let laidOutNodes = 0;
+  let reusedNodes = 0;
+  const measuredNodeIds = new Set<number>();
+  let measurementCacheHits = 0;
 
   function textFor(node: HostNode): string {
-    const cached = flattenedText.get(node.id);
-    if (cached !== undefined) return cached;
+    let cached = flattenedText.get(node.id);
+    if (cached === undefined && options.partial) {
+      cached = options.previous?.flattenedText.get(node.id);
+    }
+    if (cached !== undefined && textRevisions.get(node.id) === node.layoutRevision) {
+      flattenedText.set(node.id, cached);
+      return cached;
+    }
     let value = node.text;
     for (const child of node.children) value += textFor(child);
     flattenedText.set(node.id, value);
+    textRevisions.set(node.id, node.layoutRevision);
     return value;
   }
 
   function measure(node: HostNode, availableWidth: number, availableHeight: number): Measured {
-    const style = resolveStyle(node);
-    if (style.display === ENUM.displayNone) return { width: 0, height: 0 };
     const boundedWidth = Math.max(0, availableWidth);
     const boundedHeight = Math.max(0, availableHeight);
+    const key = measurementKey(boundedWidth, boundedHeight);
+    const bucket = measurements.get(node.id);
+    if (bucket?.revision === node.layoutRevision) {
+      const cached = bucket.values.get(key);
+      if (cached !== undefined) {
+        measurementCacheHits += 1;
+        return cached;
+      }
+    }
+
+    measuredNodeIds.add(node.id);
+    const style = resolveStyle(node);
+    let measured: Measured;
+    if (style.display === ENUM.displayNone) {
+      measured = { width: 0, height: 0 };
+      rememberMeasurement(node, key, measured, bucket);
+      return measured;
+    }
     let natural: Measured;
     if (node.type === NODE.text) {
       natural = textExtent(textFor(node), Math.max(1, boundedWidth));
@@ -127,15 +251,57 @@ function createLayoutEngine(resolveStyle: StyleResolver): LayoutEngine {
               height: main + style.padding.top + style.padding.bottom,
             };
     }
-    return {
+    measured = {
       width: resolveDimension(style.width, natural.width, boundedWidth, style.minWidth, style.maxWidth),
       height: resolveDimension(style.height, natural.height, boundedHeight, style.minHeight, style.maxHeight),
     };
+    rememberMeasurement(node, key, measured, bucket);
+    return measured;
   }
 
-  function layout(node: HostNode, rect: Rect): void {
-    const style = resolveStyle(node);
+  function rememberMeasurement(
+    node: HostNode,
+    key: string,
+    measured: Measured,
+    previousBucket: MeasurementBucket | undefined,
+  ): void {
+    const values =
+      previousBucket?.revision === node.layoutRevision
+        ? new Map(previousBucket.values)
+        : new Map<string, Measured>();
+    // Refresh overwritten keys and bound animated constraint churn per node.
+    values.delete(key);
+    values.set(key, measured);
+    while (values.size > MAX_MEASUREMENTS_PER_NODE) {
+      const oldest = values.keys().next().value;
+      if (oldest === undefined) break;
+      values.delete(oldest);
+    }
+    measurements.set(node.id, { revision: node.layoutRevision, values });
+  }
+
+  function layout(node: HostNode, rect: Rect): number {
     const normalized = normalizeRect(rect);
+    const previousEntry = options.previous?.entries.get(node.id);
+    if (
+      options.reuseGeometry === true &&
+      previousEntry !== undefined &&
+      geometryRevisions.get(node.id) === node.layoutRevision &&
+      previousEntry.rect.width === normalized.width &&
+      previousEntry.rect.height === normalized.height
+    ) {
+      let count = subtreeEntryCounts.get(node.id) ?? 1;
+      const dx = normalized.x - previousEntry.rect.x;
+      const dy = normalized.y - previousEntry.rect.y;
+      if (options.partial || dx !== 0 || dy !== 0) {
+        count = copySubtree(node, dx, dy);
+      }
+      reusedNodes += count;
+      return count;
+    }
+
+    laidOutNodes += 1;
+    const style = resolveStyle(node);
     entries.set(node.id, { node, style, rect: normalized });
     if (
       style.display === ENUM.displayNone ||
@@ -143,16 +309,21 @@ function createLayoutEngine(resolveStyle: StyleResolver): LayoutEngine {
       normalized.height === 0 ||
       node.type !== NODE.view
     ) {
-      return;
+      if (node.type === NODE.text) textFor(node);
+      removeDescendantResults(node, style.display === ENUM.displayNone);
+      geometryRevisions.set(node.id, node.layoutRevision);
+      subtreeEntryCounts.set(node.id, 1);
+      return 1;
     }
 
     const inner = innerRect(normalized, style);
+    let count = 1;
     const relative: HostNode[] = [];
     const absolute: HostNode[] = [];
     for (const child of node.children) {
       const childStyle = resolveStyle(child);
       if (childStyle.display === ENUM.displayNone) {
-        layout(child, { x: inner.x, y: inner.y, width: 0, height: 0 });
+        count += layout(child, { x: inner.x, y: inner.y, width: 0, height: 0 });
       } else if (childStyle.position === ENUM.absolute) {
         absolute.push(child);
       } else {
@@ -160,13 +331,16 @@ function createLayoutEngine(resolveStyle: StyleResolver): LayoutEngine {
       }
     }
 
-    layoutFlexChildren(relative, inner, style, measure, layout, resolveStyle);
+    count += layoutFlexChildren(relative, inner, style, measure, layout, resolveStyle);
     for (const child of absolute) {
-      layoutAbsolute(child, inner);
+      count += layoutAbsolute(child, inner);
     }
+    geometryRevisions.set(node.id, node.layoutRevision);
+    subtreeEntryCounts.set(node.id, count);
+    return count;
   }
 
-  function layoutAbsolute(node: HostNode, inner: Rect): void {
+  function layoutAbsolute(node: HostNode, inner: Rect): number {
     const style = resolveStyle(node);
     const measured = measure(node, inner.width, inner.height);
     const left = style.inset.left;
@@ -203,13 +377,53 @@ function createLayoutEngine(resolveStyle: StyleResolver): LayoutEngine {
         : bottom !== undefined
           ? inner.y + inner.height - cells(bottom) - height - style.margin.bottom
           : inner.y + style.margin.top;
-    layout(node, { x, y, width, height });
+    return layout(node, { x, y, width, height });
+  }
+
+  function copySubtree(node: HostNode, dx: number, dy: number): number {
+    const previousEntry = options.previous?.entries.get(node.id);
+    if (previousEntry === undefined) return 0;
+    entries.set(
+      node.id,
+      dx === 0 && dy === 0
+        ? previousEntry
+        : {
+            node,
+            style: previousEntry.style,
+            rect: {
+              x: previousEntry.rect.x + dx,
+              y: previousEntry.rect.y + dy,
+              width: previousEntry.rect.width,
+              height: previousEntry.rect.height,
+            },
+          },
+    );
+    const previousText = options.previous?.flattenedText.get(node.id);
+    if (previousText !== undefined) flattenedText.set(node.id, previousText);
+    let count = 1;
+    for (const child of node.children) count += copySubtree(child, dx, dy);
+    return count;
+  }
+
+  function removeDescendantResults(node: HostNode, removeText: boolean): void {
+    for (const child of node.children) {
+      entries.delete(child.id);
+      if (removeText) flattenedText.delete(child.id);
+      removeDescendantResults(child, removeText);
+    }
   }
 
   return {
     layout,
     layoutAbsolute,
-    result: () => ({ entries, flattenedText }),
+    result: () => ({
+      result: { entries, flattenedText },
+      cache: { measurements, geometryRevisions, textRevisions, subtreeEntryCounts },
+      laidOutNodes,
+      reusedNodes,
+      measuredNodes: measuredNodeIds.size,
+      measurementCacheHits,
+    }),
   };
 }
 
@@ -218,10 +432,10 @@ function layoutFlexChildren(
   inner: Rect,
   parentStyle: ComputedStyle,
   measure: (node: HostNode, width: number, height: number) => Measured,
-  layout: (node: HostNode, rect: Rect) => void,
+  layout: (node: HostNode, rect: Rect) => number,
   resolveStyle: StyleResolver,
-): void {
-  if (children.length === 0) return;
+): number {
+  if (children.length === 0) return 0;
   const row = parentStyle.flexDirection === ENUM.flexRow;
   const availableMain = row ? inner.width : inner.height;
   const availableCross = row ? inner.height : inner.width;
@@ -317,6 +531,7 @@ function layoutFlexChildren(
       break;
   }
 
+  let count = 0;
   for (const item of items) {
     cursor += item.marginMainBefore;
     const crossAvailable = Math.max(0, availableCross - item.marginCrossBefore - item.marginCrossAfter);
@@ -334,9 +549,14 @@ function layoutFlexChildren(
     const rect: Rect = row
       ? { x: inner.x + cursor, y: inner.y + crossOffset, width: item.main, height: cross }
       : { x: inner.x + crossOffset, y: inner.y + cursor, width: cross, height: item.main };
-    layout(item.node, rect);
+    count += layout(item.node, rect);
     cursor += item.main + item.marginMainAfter + parentStyle.gap + extraGap;
   }
+  return count;
+}
+
+function measurementKey(width: number, height: number): string {
+  return `${width}:${height}`;
 }
 
 function resolveAbsoluteSize(

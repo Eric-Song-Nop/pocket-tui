@@ -44,17 +44,23 @@ rasterization when it is clean.
 
 The reference backend is not yet the final native incremental renderer
 described in [the architecture document](architecture.md). It now distinguishes
-full-layout, localized-layout, and paint-only dirtiness. Paint-only frames reuse
-cached rectangles and flattened text. Geometry or text mutations beneath a
+full-layout, cache-aware Flex, localized absolute-layout, and paint-only
+dirtiness. Paint-only frames reuse cached rectangles and flattened text and
+refresh only changed computed styles. Geometry or text mutations beneath a
 retained absolute-positioned node rerun the same solver only for the nearest
-isolated absolute subtree; absolute children cannot affect their parent's Flex
-measurement. Both incremental paths refresh current styles and reraster the
-union of affected old/new subtree rows. Mutations that can affect flow layout,
-tree structure, style references/tables, focus, active state, or viewport size
-retain full JavaScript layout and bounded viewport rasterization as the oracle.
-Every path submits a complete semantic `CanvasFrame`; the Rust renderer compares
-persistent rows and emits only actual terminal damage. There are no sparse
-Canvas patch opcodes or general local Flex reflow yet.
+isolated subtree; absolute children cannot affect their parent's Flex
+measurement. Other Flex mutations run the root solver with persistent subtree
+revisions, exact available-width/height measurement keys, and same-size clean
+subtree geometry reuse. Moved clean subtrees translate without internal layout.
+Incremental paths reraster the union of affected old/new rows. Tree structure,
+style references/tables, focus, active state, and viewport size retain full
+JavaScript layout and bounded viewport rasterization as the oracle.
+
+Cache-aware Flex reduces solver work but still scans direct siblings on dirty
+ancestor paths, clones retained maps transactionally, and traverses the full
+scene to rebuild paint order. Every path submits a complete semantic
+`CanvasFrame`; the Rust renderer compares persistent rows and emits only actual
+terminal damage. There are no sparse Canvas patch opcodes yet.
 
 ## Current retained model
 
@@ -200,10 +206,10 @@ Pixel-oriented PocketJS operations have bounded terminal fallbacks:
 | Known unsupported style | Stores but does not paint the property | `unsupportedProperties` |
 
 `session.diagnostics` also reports live nodes, HostOps mutations, rendered and
-skipped frames, full/localized/reused layout frames, recomputed layout
-nodes/roots, full and incremental raster frames, last/total repainted rows, the
-latest compact run count, missing style references, `framePolicy`,
-`steppedFrames`, `idleWaits`, and `wakeSignals`.
+skipped frames, full/cached/localized/reused layout frames,
+recomputed/measured/reused layout nodes, relayout roots, full and incremental
+raster frames, last/total repainted rows, the latest compact run count, missing
+style references, `framePolicy`, `steppedFrames`, `idleWaits`, and `wakeSignals`.
 Signal Below exposes a small `HOST LINK` sample of these counters in its
 receiver rail so the retained backend is observable while playing.
 

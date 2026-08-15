@@ -3,6 +3,11 @@ import type { PropertyMap } from "./style.js";
 export interface HostNode {
   readonly id: number;
   readonly type: number;
+  /**
+   * Monotonic revision for layout-affecting mutations anywhere in this
+   * retained subtree. Layout caches snapshot this value before reuse.
+   */
+  layoutRevision: number;
   parent: HostNode | null;
   readonly children: HostNode[];
   text: string;

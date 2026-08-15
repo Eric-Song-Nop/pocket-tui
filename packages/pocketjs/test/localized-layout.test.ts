@@ -260,7 +260,39 @@ describe("PocketJS localized absolute layout", () => {
     });
   });
 
-  test("falls back to the full oracle when an absolute boundary or flex flow can change", () => {
+  test("invalidates localized subtree counts before a later cached Flex pass", () => {
+    const surface = new RecordingSurface({ columns: 18, rows: 8 });
+    const host = createPocketTuiHost({ surface, colorMode: "truecolor" });
+    const panel = host.ops.createNode(NODE.view);
+    const child = host.ops.createNode(NODE.view);
+    const label = host.ops.createNode(NODE.text);
+    const flow = host.ops.createNode(NODE.text);
+    host.ops.insertBefore(ROOT_ID, panel, 0);
+    host.ops.insertBefore(panel, child, 0);
+    host.ops.insertBefore(child, label, 0);
+    host.ops.insertBefore(ROOT_ID, flow, 0);
+    absoluteRect(host, panel, 0, 0, 8, 3);
+    host.ops.setText(label, "nested");
+    host.ops.setText(flow, "flow");
+    host.render();
+
+    host.ops.setProp(panel, PROP.paddingT, 3);
+    host.render();
+    expect(host.nodeRect(label)).toBeUndefined();
+
+    const before = host.diagnostics;
+    host.ops.setText(flow, "flow changes");
+    const cached = host.render();
+    expect(host.diagnostics.cachedLayoutFrames).toBe(before.cachedLayoutFrames + 1);
+    const retainedEntries = host.snapshot().filter(({ rect }) => rect !== undefined).length;
+    expect(
+      host.diagnostics.lastLayoutNodes + host.diagnostics.lastReusedLayoutNodes,
+    ).toBe(retainedEntries);
+    expect(cached).toEqual(host.render(true));
+    expectDiagnosticSums(host);
+  });
+
+  test("uses cached root layout when an absolute boundary or Flex flow can change", () => {
     const surface = new RecordingSurface({ columns: 18, rows: 8 });
     const host = createPocketTuiHost({ surface, colorMode: "truecolor" });
     const flow = host.ops.createNode(NODE.view);
@@ -279,9 +311,9 @@ describe("PocketJS localized absolute layout", () => {
     host.ops.setText(absolute, "abs");
     host.render();
 
-    assertFullOracle(host, () => host.ops.setProp(absolute, PROP.posType, ENUM.relative));
-    assertFullOracle(host, () => host.ops.setProp(first, PROP.width, 7));
-    assertFullOracle(host, () => host.ops.setText(second, "text changes flex measurement"));
+    assertCachedOracle(host, () => host.ops.setProp(absolute, PROP.posType, ENUM.relative));
+    assertCachedOracle(host, () => host.ops.setProp(first, PROP.width, 7));
+    assertCachedOracle(host, () => host.ops.setText(second, "text changes flex measurement"));
   });
 
   test("combines paint and localized layout mutations without ordering sensitivity", () => {
@@ -414,15 +446,17 @@ describe("PocketJS localized absolute layout", () => {
     surface.onPresent = () => host.ops.setProp(slot, PROP.posType, ENUM.relative);
     host.render();
     expect(host.renderPending).toBe(true);
-    const beforeFullRetry = host.diagnostics;
-    const fullRetry = host.render();
+    const beforeCachedRetry = host.diagnostics;
+    const cachedRetry = host.render();
     expect(host.renderPending).toBe(false);
     expect(host.diagnostics).toMatchObject({
-      fullLayoutFrames: beforeFullRetry.fullLayoutFrames + 1,
-      localizedLayoutFrames: beforeFullRetry.localizedLayoutFrames,
-      fullRasterFrames: beforeFullRetry.fullRasterFrames + 1,
+      fullLayoutFrames: beforeCachedRetry.fullLayoutFrames,
+      localizedLayoutFrames: beforeCachedRetry.localizedLayoutFrames,
+      cachedLayoutFrames: beforeCachedRetry.cachedLayoutFrames + 1,
+      fullRasterFrames: beforeCachedRetry.fullRasterFrames,
+      incrementalRasterFrames: beforeCachedRetry.incrementalRasterFrames + 1,
     });
-    expect(fullRetry).toEqual(host.render(true));
+    expect(cachedRetry).toEqual(host.render(true));
     expectDiagnosticSums(host);
   });
 
@@ -554,15 +588,49 @@ function assertFullOracle(
   expectDiagnosticSums(host);
 }
 
+function assertCachedOracle(
+  host: ReturnType<typeof createPocketTuiHost>,
+  mutate: () => void,
+): void {
+  const before = host.diagnostics;
+  mutate();
+  const cached = host.render();
+  const after = host.diagnostics;
+  const geometry = geometrySnapshot(host);
+
+  expect(after).toMatchObject({
+    renderedFrames: before.renderedFrames + 1,
+    layoutPasses: before.layoutPasses + 1,
+    fullLayoutFrames: before.fullLayoutFrames,
+    localizedLayoutFrames: before.localizedLayoutFrames,
+    cachedLayoutFrames: before.cachedLayoutFrames + 1,
+    reusedLayoutFrames: before.reusedLayoutFrames,
+    fullRasterFrames: before.fullRasterFrames,
+    incrementalRasterFrames: before.incrementalRasterFrames + 1,
+    lastRelayoutRoots: 1,
+  });
+  expect(after.lastLayoutNodes).toBeGreaterThan(0);
+  expect(after.layoutNodes).toBe(before.layoutNodes + after.lastLayoutNodes);
+  expectDiagnosticSums(host);
+
+  const oracle = host.render(true);
+  expect(cached).toEqual(oracle);
+  expect(geometrySnapshot(host)).toEqual(geometry);
+  expectDiagnosticSums(host);
+}
+
 function expectDiagnosticSums(host: ReturnType<typeof createPocketTuiHost>): void {
   const diagnostics = host.diagnostics;
   expect(diagnostics.renderedFrames).toBe(
     diagnostics.fullLayoutFrames +
       diagnostics.localizedLayoutFrames +
+      diagnostics.cachedLayoutFrames +
       diagnostics.reusedLayoutFrames,
   );
   expect(diagnostics.layoutPasses).toBe(
-    diagnostics.fullLayoutFrames + diagnostics.localizedLayoutFrames,
+    diagnostics.fullLayoutFrames +
+      diagnostics.localizedLayoutFrames +
+      diagnostics.cachedLayoutFrames,
   );
   expect(diagnostics.renderedFrames).toBe(
     diagnostics.fullRasterFrames + diagnostics.incrementalRasterFrames,
