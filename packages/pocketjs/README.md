@@ -108,20 +108,25 @@ generational shadow tree. Clean calls to `host.render()` return the previous
 frame without layout or raster work. Paint-only mutations (`overflow`,
 `zIndex`, background/opacity/border paint, and text color/alignment/tracking)
 reuse the last cell geometry and flattened text. The backend refreshes computed
-styles, unions the previous row bounds of every changed subtree, and replays the
-scene only into those rows; unaffected compact runs are retained. Geometry and
-text mutations below an absolute-positioned node reuse its cached parent and
-run the same layout solver only for the nearest isolated absolute subtree. The
-damage set includes both its old and new subtree rows. Multiple roots coalesce,
-while flow layout, tree, style-reference/table, focus, active-state, and resize
-changes fall back to full layout and bounded viewport rasterization as the
+styles only for changed entries, unions the previous row bounds of every
+changed subtree, and replays the scene only into those rows; unaffected compact
+runs are retained. Geometry and text mutations below an absolute-positioned
+node reuse its cached parent and run the same layout solver only for the nearest
+isolated absolute subtree. Other row/column Flex mutations run a cache-aware
+root pass: every retained subtree carries a monotonic layout revision,
+measurements are keyed by the exact available width and height, same-size clean
+subtrees retain their geometry, and moved clean subtrees translate as a unit.
+The damage set compares old/new geometry and text, including fixed rectangles
+whose line height changes. Tree, style-reference/table, focus, active-state,
+and resize changes retain full layout and bounded viewport rasterization as the
 correctness oracle.
 
-This is incremental JavaScript layout and paint for absolute islands, but it is
-not yet general local Flex reflow or sparse Canvas transport. Rasterization
-still traverses the retained scene for paint order, but materializes only dirty
-rows. Every rendered frame submits a complete semantic `CanvasFrame`; Rust
-persistent row damage limits the actual terminal output downstream.
+This removes repeated Flex measurement and layout work, but is not yet an
+end-to-end O(delta) renderer. A cached root pass still scans direct Flex
+siblings and clones retained result/cache maps, while rasterization traverses
+the retained scene to rebuild paint order even though it materializes only
+dirty rows. Every rendered frame submits a complete semantic `CanvasFrame`;
+Rust persistent row damage limits the actual terminal output downstream.
 
 The implemented style subset includes cell flex row/column layout,
 grow/shrink/basis, padding/margin/gap, absolute positioning, clipping, z-order,
@@ -183,9 +188,10 @@ calls explicitly.
 
 `session.diagnostics` counts those fallbacks and reports live nodes, HostOps
 mutations, rendered/skipped frames, full versus incremental raster frames,
-full/localized/reused layout frames, recomputed layout nodes/roots, repainted
-rows, latest run count, missing styles, known unsupported properties, scheduler
-policy, stepped frames, idle waits, and wake signals.
+full/cached/localized/reused layout frames, recomputed/measured/reused layout
+nodes, relayout roots, repainted rows, latest run count, missing styles, known
+unsupported properties, scheduler policy, stepped frames, idle waits, and wake
+signals.
 
 PocketJS 0.6 keeps its renderer root and frame handler in process-global state,
 so this package permits one active session per process. A concurrent mount

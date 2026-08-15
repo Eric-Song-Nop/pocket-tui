@@ -230,7 +230,7 @@ describe("PocketJS incremental paint", () => {
     );
   });
 
-  test("keeps flow geometry, tree, style, focus, active, and resize on the full oracle", () => {
+  test("caches flow geometry while tree, style, focus, active, and resize retain the full oracle", () => {
     const surface = new RecordingSurface({ columns: 14, rows: 6 });
     const host = createPocketTuiHost({ surface, colorMode: "truecolor" });
     const panel = host.ops.createNode(NODE.view);
@@ -242,8 +242,8 @@ describe("PocketJS incremental paint", () => {
     host.ops.setText(text, "full");
     host.render();
 
-    assertFullInvalidation(host, () => host.ops.setProp(panel, PROP.width, 11), 6);
-    assertFullInvalidation(host, () => host.ops.setText(text, "full oracle"), 6);
+    assertCachedInvalidation(host, () => host.ops.setProp(panel, PROP.width, 11));
+    assertCachedInvalidation(host, () => host.ops.setText(text, "cached oracle"));
     let added = 0;
     assertFullInvalidation(
       host,
@@ -330,23 +330,28 @@ describe("PocketJS incremental paint", () => {
     await host.flush();
     host.ops.setProp(text, PROP.textColor, 0xffff_ee44);
     host.setCursor({ row: 0, column: 0, visible: false });
-    const beforeFullPresent = notifications;
-    let fullCallbacks = 0;
+    const beforeLayoutPresent = notifications;
+    let layoutCallbacks = 0;
     surface.onPresent = () => {
-      fullCallbacks += 1;
+      layoutCallbacks += 1;
       host.ops.setProp(text, PROP.width, 8);
     };
     host.render();
 
-    expect(fullCallbacks).toBe(1);
+    expect(layoutCallbacks).toBe(1);
     expect(host.renderPending).toBe(true);
-    expect(notifications).toBe(beforeFullPresent + 1);
-    const beforeFullRetry = host.diagnostics;
-    const fullRetry = host.render();
-    expect(host.diagnostics.layoutPasses).toBe(beforeFullRetry.layoutPasses + 1);
-    expect(host.diagnostics.fullRasterFrames).toBe(beforeFullRetry.fullRasterFrames + 1);
+    expect(notifications).toBe(beforeLayoutPresent + 1);
+    const beforeLayoutRetry = host.diagnostics;
+    const layoutRetry = host.render();
+    expect(host.diagnostics).toMatchObject({
+      layoutPasses: beforeLayoutRetry.layoutPasses + 1,
+      fullLayoutFrames: beforeLayoutRetry.fullLayoutFrames,
+      cachedLayoutFrames: beforeLayoutRetry.cachedLayoutFrames + 1,
+      fullRasterFrames: beforeLayoutRetry.fullRasterFrames,
+      incrementalRasterFrames: beforeLayoutRetry.incrementalRasterFrames + 1,
+    });
     expect(host.renderPending).toBe(false);
-    expect(fullRetry).toEqual(host.render(true));
+    expect(layoutRetry).toEqual(host.render(true));
     dispose();
   });
 
@@ -441,7 +446,7 @@ describe("PocketJS incremental paint", () => {
     expect(host.frame).toEqual(host.render(true));
   });
 
-  test("accounts a reentrant resize against the submitted full frame before retrying", () => {
+  test("accounts a reentrant resize against the submitted cached frame before a full retry", () => {
     const surface = new RecordingSurface({ columns: 10, rows: 4 });
     const host = createPocketTuiHost({ surface, colorMode: "truecolor" });
     const panel = host.ops.createNode(NODE.view);
@@ -468,9 +473,11 @@ describe("PocketJS incremental paint", () => {
     expect(host.renderPending).toBe(true);
     expect(host.diagnostics).toMatchObject({
       renderedFrames: beforePresent.renderedFrames + 1,
-      fullRasterFrames: beforePresent.fullRasterFrames + 1,
-      lastRepaintedRows: 4,
-      repaintedRows: beforePresent.repaintedRows + 4,
+      cachedLayoutFrames: beforePresent.cachedLayoutFrames + 1,
+      fullRasterFrames: beforePresent.fullRasterFrames,
+      incrementalRasterFrames: beforePresent.incrementalRasterFrames + 1,
+      lastRepaintedRows: 1,
+      repaintedRows: beforePresent.repaintedRows + 1,
     });
     expectDiagnosticSums(host);
 
@@ -636,6 +643,29 @@ function assertFullInvalidation(
   expect(after.repaintedRows).toBe(before.repaintedRows + repaintedRows);
 }
 
+function assertCachedInvalidation(
+  host: ReturnType<typeof createPocketTuiHost>,
+  mutate: () => void,
+): void {
+  const before = host.diagnostics;
+  mutate();
+  expect(host.renderPending).toBe(true);
+  const incremental = host.render();
+  const after = host.diagnostics;
+  expect(after).toMatchObject({
+    layoutPasses: before.layoutPasses + 1,
+    fullLayoutFrames: before.fullLayoutFrames,
+    localizedLayoutFrames: before.localizedLayoutFrames,
+    cachedLayoutFrames: before.cachedLayoutFrames + 1,
+    fullRasterFrames: before.fullRasterFrames,
+    incrementalRasterFrames: before.incrementalRasterFrames + 1,
+  });
+  expect(after.lastLayoutNodes).toBeGreaterThan(0);
+  expect(after.lastMeasuredNodes).toBeGreaterThan(0);
+  expect(incremental).toEqual(host.render(true));
+  expectDiagnosticSums(host);
+}
+
 function assertLocalizedInvalidation(
   host: ReturnType<typeof createPocketTuiHost>,
   mutate: () => void,
@@ -662,17 +692,22 @@ function expectDiagnosticSums(host: ReturnType<typeof createPocketTuiHost>): voi
   expect(diagnostics.renderedFrames).toBe(
     diagnostics.fullLayoutFrames +
       diagnostics.localizedLayoutFrames +
+      diagnostics.cachedLayoutFrames +
       diagnostics.reusedLayoutFrames,
   );
   expect(diagnostics.layoutPasses).toBe(
-    diagnostics.fullLayoutFrames + diagnostics.localizedLayoutFrames,
+    diagnostics.fullLayoutFrames +
+      diagnostics.localizedLayoutFrames +
+      diagnostics.cachedLayoutFrames,
   );
   expect(diagnostics.renderedFrames).toBe(
     diagnostics.fullRasterFrames + diagnostics.incrementalRasterFrames,
   );
   expect(diagnostics.fullLayoutFrames).toBe(diagnostics.fullRasterFrames);
   expect(diagnostics.incrementalRasterFrames).toBe(
-    diagnostics.localizedLayoutFrames + diagnostics.reusedLayoutFrames,
+    diagnostics.localizedLayoutFrames +
+      diagnostics.cachedLayoutFrames +
+      diagnostics.reusedLayoutFrames,
   );
 }
 
