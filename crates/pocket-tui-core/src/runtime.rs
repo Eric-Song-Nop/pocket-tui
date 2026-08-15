@@ -5,10 +5,10 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    AuxId, BlockId, BoxNode, Cell, DirtyMask, DirtyReason, DocumentDb, DocumentError, DocumentId,
-    DocumentStats, GraphemeStore, LayoutSpec, Length, NodeId, NodeKind, Rect, ResourceError,
-    ResourceSnapshot, RowDamage, SceneDb, SceneError, Screen, ScreenError, ScreenRow,
-    ScreenSnapshot, Size, Style, StyleId, StyleStore, TranscriptNode,
+    AuxId, BlockId, BoxNode, CanvasRun, Cell, DirtyMask, DirtyReason, DocumentDb, DocumentError,
+    DocumentId, DocumentStats, GraphemeStore, LayoutSpec, Length, NodeId, NodeKind, Rect,
+    ResourceError, ResourceSnapshot, RowDamage, SceneDb, SceneError, Screen, ScreenError,
+    ScreenRow, ScreenSnapshot, Size, Style, StyleId, StyleStore, TranscriptNode,
 };
 
 /// Monotonic native frame generation.
@@ -100,6 +100,17 @@ impl Runtime {
 
     pub fn scene_mut(&mut self) -> &mut SceneDb {
         &mut self.scene
+    }
+
+    /// Applies fixed-size, whole-row replacements to a retained canvas.
+    pub fn replace_canvas_rows(
+        &mut self,
+        id: NodeId,
+        width: u16,
+        height: u16,
+        rows: Vec<(u16, Vec<CanvasRun>)>,
+    ) -> Result<(), RuntimeError> {
+        Ok(self.scene.replace_canvas_rows(id, width, height, rows)?)
     }
 
     pub const fn documents(&self) -> &DocumentDb {
@@ -618,7 +629,7 @@ pub enum RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CanvasNode, CanvasRun, Color, TextAttributes};
+    use crate::{CanvasNode, Color, TextAttributes};
 
     #[test]
     fn canvas_runs_paint_styles_and_damage_only_changed_rows() {
@@ -756,5 +767,102 @@ mod tests {
             .map(|cell| frame.resources.grapheme(cell.grapheme()).unwrap().as_str())
             .collect();
         assert_eq!(row1_text, "SAFE");
+    }
+
+    #[test]
+    fn canvas_row_patch_preserves_omitted_rows_and_limits_screen_damage() {
+        let mut runtime = Runtime::new(Size::new(5, 3));
+        let canvas = runtime
+            .scene_mut()
+            .create_canvas(
+                None,
+                CanvasNode {
+                    width: 5,
+                    height: 3,
+                    runs: vec![
+                        canvas_run(0, 0, "A"),
+                        canvas_run(1, 0, "B"),
+                        canvas_run(2, 0, "C"),
+                    ],
+                    layout: LayoutSpec::FILL,
+                },
+            )
+            .unwrap();
+        runtime.render_frame().unwrap();
+
+        runtime
+            .replace_canvas_rows(canvas, 5, 3, vec![(1, vec![canvas_run(99, 0, "X")])])
+            .unwrap();
+        let frame = runtime.render_frame().unwrap();
+
+        assert_eq!(frame.dirty_rows.len(), 1);
+        assert_eq!(frame.dirty_rows[0].row, crate::Row(1));
+        assert_eq!(frame.dirty_rows[0].span, crate::DirtySpan::new(0, 1));
+        assert_eq!(screen_row_text(&frame, 0), "A    ");
+        assert_eq!(screen_row_text(&frame, 1), "X    ");
+        assert_eq!(screen_row_text(&frame, 2), "C    ");
+    }
+
+    #[test]
+    fn canvas_row_patch_repairs_wide_ownership_and_reveals_lower_content() {
+        let mut runtime = Runtime::new(Size::new(5, 1));
+        runtime
+            .scene_mut()
+            .create_text(None, crate::TextNode::new("UNDER"))
+            .unwrap();
+        let overlay = runtime
+            .scene_mut()
+            .create_canvas(
+                None,
+                CanvasNode {
+                    width: 5,
+                    height: 1,
+                    runs: vec![canvas_run(0, 1, "界")],
+                    layout: LayoutSpec::FILL,
+                },
+            )
+            .unwrap();
+
+        let first = runtime.render_frame().unwrap();
+        assert_eq!(screen_row_text(&first, 0), "U界ER");
+
+        runtime
+            .replace_canvas_rows(overlay, 5, 1, vec![(0, vec![canvas_run(0, 1, "X")])])
+            .unwrap();
+        let narrow = runtime.render_frame().unwrap();
+        assert_eq!(screen_row_text(&narrow, 0), "UXDER");
+        assert_eq!(narrow.dirty_rows.len(), 1);
+        assert_eq!(narrow.dirty_rows[0].span, crate::DirtySpan::new(1, 3));
+
+        runtime
+            .replace_canvas_rows(overlay, 5, 1, vec![(0, Vec::new())])
+            .unwrap();
+        let cleared = runtime.render_frame().unwrap();
+        assert_eq!(screen_row_text(&cleared, 0), "UNDER");
+        assert_eq!(cleared.dirty_rows.len(), 1);
+        assert_eq!(cleared.dirty_rows[0].span, crate::DirtySpan::new(1, 2));
+    }
+
+    fn canvas_run(row: u16, column: u16, text: &str) -> CanvasRun {
+        CanvasRun {
+            row,
+            column,
+            text: text.to_owned(),
+            foreground: Color::Default,
+            background: Color::Default,
+            attributes: TextAttributes::empty(),
+        }
+    }
+
+    fn screen_row_text(frame: &FrameArtifact, row: u16) -> String {
+        frame
+            .screen
+            .row(crate::Row(row))
+            .unwrap()
+            .cells()
+            .iter()
+            .filter(|cell| cell.is_lead())
+            .map(|cell| frame.resources.grapheme(cell.grapheme()).unwrap().as_str())
+            .collect()
     }
 }

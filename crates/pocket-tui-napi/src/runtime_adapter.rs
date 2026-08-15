@@ -14,7 +14,7 @@ use pocket_tui_terminal::{
 };
 
 use crate::protocol::{
-    CanvasRun, ColorSpec, CursorShape, Direction, EffectBusProfile, Operation, Packet,
+    CanvasRow, CanvasRun, ColorSpec, CursorShape, Direction, EffectBusProfile, Operation, Packet,
 };
 
 const DEFAULT_VIEWPORT: Size = Size::new(80, 24);
@@ -33,6 +33,7 @@ enum NodeSpec {
         document: u64,
     },
     Canvas {
+        revision: u64,
         width: u16,
         height: u16,
         runs: Vec<CoreCanvasRun>,
@@ -364,6 +365,7 @@ fn is_hot_mutation(operation: &Operation<'_>) -> bool {
             | Operation::AppendBlockText { .. }
             | Operation::SealBlock { .. }
             | Operation::SetCanvasFrame { .. }
+            | Operation::SetCanvasRows { .. }
             | Operation::SetCursor { .. }
             | Operation::SetEffectBus { .. }
     )
@@ -376,6 +378,13 @@ fn validate_hot_operations(
     blocks: &HashMap<u64, BlockBinding>,
     operations: &[Operation<'_>],
 ) -> Result<(), String> {
+    #[derive(Clone, Copy)]
+    struct CanvasState {
+        revision: u64,
+        width: u16,
+        height: u16,
+    }
+
     let native_documents: HashMap<DocumentId, u64> = documents
         .iter()
         .map(|(handle, document)| (*document, *handle))
@@ -410,6 +419,7 @@ fn validate_hot_operations(
 
     let stats = runtime.stats();
     let mut appended_bytes = 0usize;
+    let mut canvas_states = HashMap::<u64, CanvasState>::new();
     for operation in operations {
         match operation {
             Operation::SetText { handle, .. } | Operation::AppendText { handle, .. } => {
@@ -474,10 +484,57 @@ fn validate_hot_operations(
                 height,
                 runs,
             } => {
-                if !matches!(&binding(bindings, *handle)?.spec, NodeSpec::Canvas { .. }) {
-                    return Err(format!("node {handle} is not Canvas"));
-                }
                 validate_canvas_frame(*width, *height, runs)?;
+                let snapshot = match &binding(bindings, *handle)?.spec {
+                    NodeSpec::Canvas {
+                        revision,
+                        width,
+                        height,
+                        ..
+                    } => CanvasState {
+                        revision: *revision,
+                        width: *width,
+                        height: *height,
+                    },
+                    _ => return Err(format!("node {handle} is not Canvas")),
+                };
+                let state = canvas_states.entry(*handle).or_insert(snapshot);
+                state.revision = next_canvas_revision(*handle, state.revision)?;
+                state.width = *width;
+                state.height = *height;
+            }
+            Operation::SetCanvasRows {
+                handle,
+                base_revision,
+                width,
+                height,
+                rows,
+            } => {
+                validate_canvas_rows(*width, *height, rows)?;
+                let snapshot = match &binding(bindings, *handle)?.spec {
+                    NodeSpec::Canvas {
+                        revision,
+                        width,
+                        height,
+                        ..
+                    } => CanvasState {
+                        revision: *revision,
+                        width: *width,
+                        height: *height,
+                    },
+                    _ => return Err(format!("node {handle} is not Canvas")),
+                };
+                let state = canvas_states.entry(*handle).or_insert(snapshot);
+                validate_canvas_patch_state(
+                    *handle,
+                    state.revision,
+                    state.width,
+                    state.height,
+                    *base_revision,
+                    *width,
+                    *height,
+                )?;
+                state.revision = next_canvas_revision(*handle, state.revision)?;
             }
             Operation::SetCursor { .. } => {}
             Operation::SetEffectBus { .. } => {}
@@ -674,6 +731,7 @@ fn apply_operation(
             blocks,
             handle,
             NodeSpec::Canvas {
+                revision: 0,
                 width: 1,
                 height: 1,
                 runs: Vec::new(),
@@ -686,25 +744,83 @@ fn apply_operation(
             runs,
         } => {
             let runs = convert_canvas_runs(width, height, &runs)?;
-            let value = binding_mut(bindings, handle)?;
-            let NodeSpec::Canvas {
-                width: current_width,
-                height: current_height,
-                runs: current_runs,
-            } = &mut value.spec
-            else {
-                return Err(format!("node {handle} is not Canvas"));
+            let (native, revision) = match &binding(bindings, handle)?.spec {
+                NodeSpec::Canvas { revision, .. } => (
+                    binding(bindings, handle)?.native,
+                    next_canvas_revision(handle, *revision)?,
+                ),
+                _ => return Err(format!("node {handle} is not Canvas")),
             };
-            *current_width = width;
-            *current_height = height;
-            current_runs.clone_from(&runs);
-            let native = value.native;
             if let Some(native) = native {
                 runtime
                     .scene_mut()
-                    .set_canvas_frame(native, width, height, runs)
+                    .set_canvas_frame(native, width, height, runs.clone())
                     .map_err(|error| error.to_string())?;
             }
+            let NodeSpec::Canvas {
+                revision: current_revision,
+                width: current_width,
+                height: current_height,
+                runs: current_runs,
+            } = &mut binding_mut(bindings, handle)?.spec
+            else {
+                unreachable!("canvas kind was checked before applying its frame")
+            };
+            *current_revision = revision;
+            *current_width = width;
+            *current_height = height;
+            *current_runs = runs;
+            Ok(())
+        }
+        Operation::SetCanvasRows {
+            handle,
+            base_revision,
+            width,
+            height,
+            rows,
+        } => {
+            let rows = convert_canvas_rows(width, height, &rows)?;
+            let (native, current_revision, current_width, current_height) =
+                match &binding(bindings, handle)?.spec {
+                    NodeSpec::Canvas {
+                        revision,
+                        width,
+                        height,
+                        ..
+                    } => (
+                        binding(bindings, handle)?.native,
+                        *revision,
+                        *width,
+                        *height,
+                    ),
+                    _ => return Err(format!("node {handle} is not Canvas")),
+                };
+            validate_canvas_patch_state(
+                handle,
+                current_revision,
+                current_width,
+                current_height,
+                base_revision,
+                width,
+                height,
+            )?;
+            let revision = next_canvas_revision(handle, current_revision)?;
+            if let Some(native) = native {
+                runtime
+                    .scene_mut()
+                    .replace_canvas_rows(native, width, height, rows.clone())
+                    .map_err(|error| error.to_string())?;
+            }
+            let NodeSpec::Canvas {
+                revision: current_revision,
+                runs: current_runs,
+                ..
+            } = &mut binding_mut(bindings, handle)?.spec
+            else {
+                unreachable!("canvas kind was checked before applying its row patch")
+            };
+            replace_pending_canvas_rows(current_runs, rows);
+            *current_revision = revision;
             Ok(())
         }
         Operation::SetCursor {
@@ -823,6 +939,7 @@ fn materialize(
                 .map_err(|error| error.to_string())?
         }
         NodeSpec::Canvas {
+            revision: _,
             width,
             height,
             runs,
@@ -892,6 +1009,85 @@ fn validate_canvas_frame(width: u16, height: u16, runs: &[CanvasRun<'_>]) -> Res
     Ok(())
 }
 
+fn validate_canvas_rows(width: u16, height: u16, rows: &[CanvasRow<'_>]) -> Result<(), String> {
+    if width == 0 || height == 0 {
+        return Err("canvas dimensions must be non-zero".to_owned());
+    }
+    if rows.is_empty() || rows.len() > usize::from(height) {
+        return Err("canvas row replacement count is zero or exceeds frame height".to_owned());
+    }
+    let mut previous_row = None;
+    for (row_index, replacement) in rows.iter().enumerate() {
+        if replacement.row >= height {
+            return Err(format!(
+                "canvas patch row {} is outside the frame",
+                replacement.row
+            ));
+        }
+        if previous_row.is_some_and(|previous| replacement.row <= previous) {
+            return Err("canvas patch rows must be strictly increasing".to_owned());
+        }
+        for (run_index, run) in replacement.runs.iter().enumerate() {
+            if run.row != replacement.row {
+                return Err(format!(
+                    "canvas patch row {row_index} run {run_index} has mismatched row {}",
+                    run.row
+                ));
+            }
+            if run.column >= width {
+                return Err(format!(
+                    "canvas patch row {row_index} run {run_index} starts outside the frame"
+                ));
+            }
+            if run.text.is_empty() {
+                return Err(format!(
+                    "canvas patch row {row_index} run {run_index} is empty"
+                ));
+            }
+            if run.text.contains(['\r', '\n']) {
+                return Err(format!(
+                    "canvas patch row {row_index} run {run_index} contains a line break"
+                ));
+            }
+            if run.attributes & !TextAttributes::all().bits() != 0 {
+                return Err(format!(
+                    "canvas patch row {row_index} run {run_index} uses unknown style attributes"
+                ));
+            }
+        }
+        previous_row = Some(replacement.row);
+    }
+    Ok(())
+}
+
+fn validate_canvas_patch_state(
+    handle: u64,
+    current_revision: u64,
+    current_width: u16,
+    current_height: u16,
+    base_revision: u64,
+    width: u16,
+    height: u16,
+) -> Result<(), String> {
+    if base_revision != current_revision {
+        return Err(format!(
+            "canvas {handle} patch base revision {base_revision} does not match current revision {current_revision}"
+        ));
+    }
+    if width != current_width || height != current_height {
+        return Err(format!(
+            "canvas {handle} patch dimensions {width}x{height} do not match current dimensions {current_width}x{current_height}"
+        ));
+    }
+    Ok(())
+}
+
+fn next_canvas_revision(handle: u64, revision: u64) -> Result<u64, String> {
+    revision
+        .checked_add(1)
+        .ok_or_else(|| format!("canvas {handle} revision overflow"))
+}
+
 fn convert_canvas_runs(
     width: u16,
     height: u16,
@@ -909,6 +1105,45 @@ fn convert_canvas_runs(
             attributes: TextAttributes::from_bits_retain(run.attributes),
         })
         .collect())
+}
+
+fn convert_canvas_rows(
+    width: u16,
+    height: u16,
+    rows: &[CanvasRow<'_>],
+) -> Result<Vec<(u16, Vec<CoreCanvasRun>)>, String> {
+    validate_canvas_rows(width, height, rows)?;
+    Ok(rows
+        .iter()
+        .map(|replacement| {
+            (
+                replacement.row,
+                replacement
+                    .runs
+                    .iter()
+                    .map(|run| CoreCanvasRun {
+                        row: replacement.row,
+                        column: run.column,
+                        text: run.text.to_owned(),
+                        foreground: convert_color(run.foreground),
+                        background: convert_color(run.background),
+                        attributes: TextAttributes::from_bits_retain(run.attributes),
+                    })
+                    .collect(),
+            )
+        })
+        .collect())
+}
+
+fn replace_pending_canvas_rows(
+    current: &mut Vec<CoreCanvasRun>,
+    replacements: Vec<(u16, Vec<CoreCanvasRun>)>,
+) {
+    let rows: Vec<u16> = replacements.iter().map(|(row, _)| *row).collect();
+    current.retain(|run| rows.binary_search(&run.row).is_err());
+    for (_, mut runs) in replacements {
+        current.append(&mut runs);
+    }
 }
 
 fn convert_color(color: ColorSpec) -> Color {
@@ -1002,6 +1237,7 @@ fn choose_terminal_size_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pocket_tui_core::NodeKind;
 
     #[test]
     fn terminal_size_prefers_stdout_then_stdin_then_environment() {
@@ -1108,5 +1344,261 @@ mod tests {
                 cursor_shade: true,
             }
         );
+    }
+
+    #[test]
+    fn canvas_full_then_ordered_row_patches_update_revisions_and_clear_empty_rows() {
+        let mut adapter = materialized_canvas_adapter();
+
+        adapter
+            .apply(Packet {
+                flags: 0,
+                sequence: 2,
+                operations: vec![
+                    Operation::SetCanvasFrame {
+                        handle: 1,
+                        width: 5,
+                        height: 3,
+                        runs: vec![
+                            canvas_run(0, 0, "A"),
+                            canvas_run(1, 0, "B"),
+                            canvas_run(2, 0, "C"),
+                        ],
+                    },
+                    Operation::SetCanvasRows {
+                        handle: 1,
+                        base_revision: 1,
+                        width: 5,
+                        height: 3,
+                        rows: vec![
+                            canvas_row(0, vec![canvas_run(0, 1, "X")]),
+                            canvas_row(1, Vec::new()),
+                        ],
+                    },
+                    Operation::SetCanvasRows {
+                        handle: 1,
+                        base_revision: 2,
+                        width: 5,
+                        height: 3,
+                        rows: vec![canvas_row(2, vec![canvas_run(2, 2, "Z")])],
+                    },
+                ],
+            })
+            .unwrap();
+
+        let (revision, width, height, runs) = canvas_snapshot(&adapter);
+        assert_eq!((revision, width, height), (3, 5, 3));
+        assert_eq!(
+            run_cells(&runs),
+            vec![(0, 1, "X".to_owned()), (2, 2, "Z".to_owned())]
+        );
+        assert_eq!(run_cells(&native_canvas_runs(&adapter)), run_cells(&runs));
+    }
+
+    #[test]
+    fn canvas_hot_validation_rejects_late_revision_dimension_and_order_errors_atomically() {
+        let mut adapter = materialized_canvas_adapter();
+        adapter
+            .apply(Packet {
+                flags: 0,
+                sequence: 2,
+                operations: vec![Operation::SetCanvasFrame {
+                    handle: 1,
+                    width: 5,
+                    height: 3,
+                    runs: vec![canvas_run(0, 0, "A"), canvas_run(2, 0, "C")],
+                }],
+            })
+            .unwrap();
+        let confirmed = canvas_snapshot(&adapter);
+        let native_confirmed = native_canvas_runs(&adapter);
+
+        let bad_revision = Packet {
+            flags: 0,
+            sequence: 3,
+            operations: vec![
+                Operation::SetCanvasRows {
+                    handle: 1,
+                    base_revision: 1,
+                    width: 5,
+                    height: 3,
+                    rows: vec![canvas_row(0, vec![canvas_run(0, 0, "first")])],
+                },
+                Operation::SetCanvasRows {
+                    handle: 1,
+                    base_revision: 1,
+                    width: 5,
+                    height: 3,
+                    rows: vec![canvas_row(2, vec![canvas_run(2, 0, "late")])],
+                },
+            ],
+        };
+        assert!(
+            adapter
+                .apply(bad_revision)
+                .unwrap_err()
+                .contains("base revision")
+        );
+        assert_canvas_unchanged(&adapter, &confirmed, &native_confirmed);
+
+        let bad_dimensions = Packet {
+            flags: 0,
+            sequence: 3,
+            operations: vec![
+                Operation::SetCanvasFrame {
+                    handle: 1,
+                    width: 6,
+                    height: 2,
+                    runs: vec![canvas_run(0, 0, "new")],
+                },
+                Operation::SetCanvasRows {
+                    handle: 1,
+                    base_revision: 2,
+                    width: 5,
+                    height: 3,
+                    rows: vec![canvas_row(0, Vec::new())],
+                },
+            ],
+        };
+        assert!(
+            adapter
+                .apply(bad_dimensions)
+                .unwrap_err()
+                .contains("dimensions")
+        );
+        assert_canvas_unchanged(&adapter, &confirmed, &native_confirmed);
+
+        let bad_order = Packet {
+            flags: 0,
+            sequence: 3,
+            operations: vec![Operation::SetCanvasRows {
+                handle: 1,
+                base_revision: 1,
+                width: 5,
+                height: 3,
+                rows: vec![canvas_row(2, Vec::new()), canvas_row(1, Vec::new())],
+            }],
+        };
+        assert!(
+            adapter
+                .apply(bad_order)
+                .unwrap_err()
+                .contains("strictly increasing")
+        );
+        assert_canvas_unchanged(&adapter, &confirmed, &native_confirmed);
+        assert_eq!(adapter.last_sequence, 2);
+    }
+
+    #[test]
+    fn canvas_revision_increment_is_checked_before_full_or_sparse_apply() {
+        let mut adapter = materialized_canvas_adapter();
+        let NodeSpec::Canvas { revision, .. } = &mut adapter.bindings.get_mut(&1).unwrap().spec
+        else {
+            panic!("expected Canvas")
+        };
+        *revision = u64::MAX;
+        let native_confirmed = native_canvas_runs(&adapter);
+
+        let full_error = adapter
+            .apply(Packet {
+                flags: 0,
+                sequence: 2,
+                operations: vec![Operation::SetCanvasFrame {
+                    handle: 1,
+                    width: 1,
+                    height: 1,
+                    runs: vec![canvas_run(0, 0, "full")],
+                }],
+            })
+            .unwrap_err();
+        assert!(full_error.contains("revision overflow"));
+        assert_eq!(native_canvas_runs(&adapter), native_confirmed);
+
+        let sparse_error = adapter
+            .apply(Packet {
+                flags: 0,
+                sequence: 2,
+                operations: vec![Operation::SetCanvasRows {
+                    handle: 1,
+                    base_revision: u64::MAX,
+                    width: 1,
+                    height: 1,
+                    rows: vec![canvas_row(0, Vec::new())],
+                }],
+            })
+            .unwrap_err();
+        assert!(sparse_error.contains("revision overflow"));
+        assert_eq!(native_canvas_runs(&adapter), native_confirmed);
+        assert_eq!(adapter.last_sequence, 1);
+    }
+
+    fn materialized_canvas_adapter() -> RuntimeAdapter {
+        let mut adapter = RuntimeAdapter::default();
+        adapter.runtime = Runtime::new(Size::new(10, 4));
+        adapter
+            .apply(Packet {
+                flags: 0,
+                sequence: 1,
+                operations: vec![
+                    Operation::CreateCanvas { handle: 1 },
+                    Operation::SetRoot { handle: 1 },
+                ],
+            })
+            .unwrap();
+        adapter
+    }
+
+    fn canvas_run(row: u16, column: u16, text: &'static str) -> CanvasRun<'static> {
+        CanvasRun {
+            row,
+            column,
+            attributes: 0,
+            foreground: ColorSpec::Default,
+            background: ColorSpec::Default,
+            text,
+        }
+    }
+
+    fn canvas_row(row: u16, runs: Vec<CanvasRun<'static>>) -> CanvasRow<'static> {
+        CanvasRow { row, runs }
+    }
+
+    fn canvas_snapshot(adapter: &RuntimeAdapter) -> (u64, u16, u16, Vec<CoreCanvasRun>) {
+        let NodeSpec::Canvas {
+            revision,
+            width,
+            height,
+            runs,
+        } = &adapter.bindings.get(&1).unwrap().spec
+        else {
+            panic!("expected Canvas")
+        };
+        (*revision, *width, *height, runs.clone())
+    }
+
+    fn native_canvas_runs(adapter: &RuntimeAdapter) -> Vec<CoreCanvasRun> {
+        let native = adapter.bindings.get(&1).unwrap().native.unwrap();
+        let NodeKind::Canvas(canvas) = adapter.runtime.scene().node(native).unwrap().kind() else {
+            panic!("expected native Canvas")
+        };
+        canvas.runs.clone()
+    }
+
+    fn run_cells(runs: &[CoreCanvasRun]) -> Vec<(u16, u16, String)> {
+        let mut cells: Vec<_> = runs
+            .iter()
+            .map(|run| (run.row, run.column, run.text.clone()))
+            .collect();
+        cells.sort();
+        cells
+    }
+
+    fn assert_canvas_unchanged(
+        adapter: &RuntimeAdapter,
+        expected: &(u64, u16, u16, Vec<CoreCanvasRun>),
+        native_expected: &[CoreCanvasRun],
+    ) {
+        assert_eq!(&canvas_snapshot(adapter), expected);
+        assert_eq!(native_canvas_runs(adapter), native_expected);
     }
 }

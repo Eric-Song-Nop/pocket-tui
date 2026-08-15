@@ -58,6 +58,13 @@ pub fn native_version() -> &'static str {
     pocket_tui_core::VERSION
 }
 
+/// Optional PTX1 capabilities supported by this native binding.
+/// Bit 0 advertises sparse retained Canvas row replacement (opcode 17).
+#[napi]
+pub const fn protocol_features() -> u32 {
+    1
+}
+
 /// A single native PocketTUI session owned by JavaScript.
 #[napi]
 pub struct NativeTui {

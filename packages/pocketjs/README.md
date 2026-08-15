@@ -128,9 +128,13 @@ revision records into copy-on-write transaction maps; a successful
 `surface.present()` commits only those patches into the retained maps, while a
 failed present discards them intact. Transaction touched keys also drive layout
 damage comparison without a full map union. Rasterization still traverses the
-retained scene to rebuild paint order even though it materializes only dirty
-rows. Every rendered frame submits a complete semantic `CanvasFrame`; Rust
-persistent row damage limits the actual terminal output downstream.
+retained scene to rebuild paint order even though it rerasterizes only dirty
+rows. The surface retains a complete semantic `CanvasFrame`, but incremental
+frames pass their exact dirty-row set to `@pocket-tui/core`. When the native
+artifact advertises support and the aligned PTX record is smaller, core sends
+revision-guarded whole-row replacements; first frames, resizes, dense changes,
+and older native artifacts use a complete frame. Rust persistent row damage
+then limits the actual terminal output downstream.
 
 The implemented style subset includes cell flex row/column layout,
 grow/shrink/basis, padding/margin/gap, absolute positioning, clipping, z-order,

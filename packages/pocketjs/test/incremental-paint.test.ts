@@ -23,6 +23,7 @@ import {
 
 class RecordingSurface implements PocketTuiSurface {
   readonly frames: CanvasFrame[] = [];
+  readonly dirtyRowHints: Array<readonly number[] | undefined> = [];
   failNextPresent: Error | undefined;
   onPresent: ((frame: CanvasFrame) => void) | undefined;
 
@@ -32,11 +33,14 @@ class RecordingSurface implements PocketTuiSurface {
     return this.size;
   }
 
-  present(frame: CanvasFrame): void {
+  present(frame: CanvasFrame, dirtyRows?: ReadonlySet<number>): void {
     const failure = this.failNextPresent;
     this.failNextPresent = undefined;
     if (failure !== undefined) throw failure;
     this.frames.push(frame);
+    this.dirtyRowHints.push(
+      dirtyRows === undefined ? undefined : [...dirtyRows].sort((left, right) => left - right),
+    );
     const callback = this.onPresent;
     this.onPresent = undefined;
     callback?.(frame);
@@ -106,6 +110,30 @@ describe("PocketJS incremental paint", () => {
       lastRepaintedRows: 5,
       repaintedRows: 5,
     });
+    expect(surface.dirtyRowHints).toEqual([undefined]);
+  });
+
+  test("passes exact whole-row patch hints while full and resize frames stay authoritative", () => {
+    const surface = new RecordingSurface({ columns: 12, rows: 6 });
+    const host = createPocketTuiHost({ surface, colorMode: "truecolor" });
+    const top = host.ops.createNode(NODE.view);
+    const bottom = host.ops.createNode(NODE.view);
+    host.ops.insertBefore(ROOT_ID, top, 0);
+    host.ops.insertBefore(ROOT_ID, bottom, 0);
+    absoluteRect(host, top, 1, 1, 4, 1);
+    absoluteRect(host, bottom, 1, 4, 4, 1);
+    host.ops.setProp(top, PROP.bgColor, 0xff22_2222);
+    host.ops.setProp(bottom, PROP.bgColor, 0xff44_4444);
+
+    host.render();
+    host.ops.setProp(top, PROP.bgColor, 0xff00_00ff);
+    host.ops.setProp(bottom, PROP.bgColor, 0xffff_0000);
+    host.render();
+    host.render(true);
+    host.resize(10, 5);
+    host.render();
+
+    expect(surface.dirtyRowHints).toEqual([undefined, [1, 4], undefined, undefined]);
   });
 
   test("reuses geometry for every paint-only property and matches a full-render oracle", () => {
