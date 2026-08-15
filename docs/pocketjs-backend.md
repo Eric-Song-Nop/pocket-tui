@@ -57,10 +57,13 @@ style references/tables, focus, active state, and viewport size retain full
 JavaScript layout and bounded viewport rasterization as the oracle.
 
 Cache-aware Flex reduces solver work but still scans direct siblings on dirty
-ancestor paths, clones retained maps transactionally, and traverses the full
-scene to rebuild paint order. Every path submits a complete semantic
-`CanvasFrame`; the Rust renderer compares persistent rows and emits only actual
-terminal damage. There are no sparse Canvas patch opcodes yet.
+ancestor paths. Layout, flattened-text, measurement, and revision candidates
+use copy-on-write transaction maps: failed presents discard their patches, and
+successful presents apply only touched keys to the last confirmed maps. Those
+same touched keys bound old/new layout damage comparison. Rasterization still
+traverses the full scene to rebuild paint order. Every path submits a complete
+semantic `CanvasFrame`; the Rust renderer compares persistent rows and emits
+only actual terminal damage. There are no sparse Canvas patch opcodes yet.
 
 ## Current retained model
 

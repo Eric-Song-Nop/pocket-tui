@@ -33,6 +33,11 @@ import {
 } from "./spec.js";
 import { parseStyleTable, type HostStyleRecord, type PropertyMap } from "./style.js";
 import { createCoreSurface, type PocketTuiSurface } from "./surface.js";
+import {
+  beginMapTransaction,
+  collectChangedMapKeys,
+  commitMap,
+} from "./transaction-map.js";
 import { lineWidth } from "./unicode.js";
 
 const PAINT_ONLY_PROPERTIES = new Set<number>([
@@ -586,8 +591,19 @@ export class PocketTuiHost {
       if (notifySurfaceWork || promotedRenderRetry) this.#notifyWorkNeeded();
       throw error;
     }
-    this.#lastLayout = layout;
-    this.#lastLayoutCache = layoutCache;
+    this.#lastLayout = {
+      entries: commitMap(layout.entries),
+      flattenedText: commitMap(layout.flattenedText),
+    };
+    this.#lastLayoutCache =
+      layoutCache === undefined
+        ? undefined
+        : {
+            measurements: commitMap(layoutCache.measurements),
+            geometryRevisions: commitMap(layoutCache.geometryRevisions),
+            textRevisions: commitMap(layoutCache.textRevisions),
+            subtreeEntryCounts: commitMap(layoutCache.subtreeEntryCounts),
+          };
     this.#lastPaintOrder = raster.paintOrder;
     this.#lastFrame = raster.frame;
     const retainedRenderWork = mutationRevision !== this.#mutationRevision;
@@ -972,7 +988,7 @@ export class PocketTuiHost {
 
   #refreshPaintStyles(previous: LayoutResult): LayoutResult {
     if (this.#paintDirtyNodes.size === 0) return previous;
-    const entries = new Map(previous.entries);
+    const entries = beginMapTransaction(previous.entries);
     for (const node of this.#paintDirtyNodes) {
       const entry = entries.get(node.id);
       if (entry === undefined) continue;
@@ -1027,8 +1043,8 @@ export class PocketTuiHost {
           (other) => other !== candidate && isAncestor(other, candidate),
         ),
     );
-    const entries = new Map(previous.entries);
-    const flattenedText = new Map(previous.flattenedText);
+    const entries = beginMapTransaction(previous.entries);
+    const flattenedText = beginMapTransaction(previous.flattenedText);
     const dirtyRows = new Set<number>();
     let layoutNodes = 0;
     let measuredNodes = 0;
@@ -1064,8 +1080,8 @@ export class PocketTuiHost {
     roots: readonly HostNode[],
   ): LayoutCache | undefined {
     if (cache === undefined || roots.length === 0) return cache;
-    const geometryRevisions = new Map(cache.geometryRevisions);
-    const subtreeEntryCounts = new Map(cache.subtreeEntryCounts);
+    const geometryRevisions = beginMapTransaction(cache.geometryRevisions);
+    const subtreeEntryCounts = beginMapTransaction(cache.subtreeEntryCounts);
     const invalidate = (node: HostNode): void => {
       geometryRevisions.delete(node.id);
       subtreeEntryCounts.delete(node.id);
@@ -1090,10 +1106,14 @@ export class PocketTuiHost {
     current: LayoutResult,
     rows = new Set<number>(),
   ): Set<number> {
-    const ids = new Set<number>([
-      ...previous.entries.keys(),
-      ...current.entries.keys(),
-    ]);
+    const ids = new Set<number>();
+    const preciseEntries = collectChangedMapKeys(current.entries, ids);
+    const preciseText = collectChangedMapKeys(current.flattenedText, ids);
+    const precise = preciseEntries && preciseText;
+    if (!precise) {
+      for (const id of previous.entries.keys()) ids.add(id);
+      for (const id of current.entries.keys()) ids.add(id);
+    }
     for (const id of ids) {
       const before = previous.entries.get(id);
       const after = current.entries.get(id);

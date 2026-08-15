@@ -123,10 +123,14 @@ correctness oracle.
 
 This removes repeated Flex measurement and layout work, but is not yet an
 end-to-end O(delta) renderer. A cached root pass still scans direct Flex
-siblings and clones retained result/cache maps, while rasterization traverses
-the retained scene to rebuild paint order even though it materializes only
-dirty rows. Every rendered frame submits a complete semantic `CanvasFrame`;
-Rust persistent row damage limits the actual terminal output downstream.
+siblings. Frame candidates now write changed layout, text, measurement, and
+revision records into copy-on-write transaction maps; a successful
+`surface.present()` commits only those patches into the retained maps, while a
+failed present discards them intact. Transaction touched keys also drive layout
+damage comparison without a full map union. Rasterization still traverses the
+retained scene to rebuild paint order even though it materializes only dirty
+rows. Every rendered frame submits a complete semantic `CanvasFrame`; Rust
+persistent row damage limits the actual terminal output downstream.
 
 The implemented style subset includes cell flex row/column layout,
 grow/shrink/basis, padding/margin/gap, absolute positioning, clipping, z-order,
