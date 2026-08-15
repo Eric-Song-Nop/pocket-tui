@@ -6,6 +6,10 @@ export interface NativeTuiSession {
   start(): void;
   flush(): void;
   pollInput(): NativeInputEvent[];
+  /** Register the native terminal-readiness edge used by adaptive schedulers. */
+  onInputReady?(callback: () => void): void;
+  /** Remove the readiness callback and stop its native watcher. */
+  clearInputReady?(): void;
   viewportSize?(): NativeViewportSize;
   memoryStats(): NativeMemoryStats;
   close(): void;

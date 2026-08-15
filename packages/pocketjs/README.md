@@ -23,6 +23,7 @@ const session = await mountPocketTui(() => App(), {
   },
   colorMode: ghostty ? "truecolor" : "ansi16",
   fps: 30,
+  framePolicy: "adaptive",
   onInput(event, current) {
     if (event.kind === "key" && event.ctrl && event.key.toLowerCase() === "c") {
       current.requestClose();
@@ -40,8 +41,17 @@ the first terminal flush. `session.close()` disposes PocketJS and restores the
 terminal; it is idempotent and is also called when `run()` exits.
 
 Use `session.step()` when an external loop or a deterministic test should drive
-one frame at a time. An injectable `PocketTuiSurface` keeps HostOps contract
-tests independent of a TTY.
+one frame at a time. Steps are single-flight and cannot overlap `run()`;
+`close()` waits for an already accepted step to reach its teardown-safe point.
+An injectable `PocketTuiSurface` keeps HostOps contract tests independent of a
+TTY.
+
+`framePolicy: "fixed"` remains the compatibility default. The opt-in
+`"adaptive"` policy sleeps when the tree and surface are clean, no button
+edge is pending, and no lifecycle hook has leased another frame. Native stdin
+readiness, actual viewport changes, Solid-driven HostOps mutations, and
+`requestFrame()` wake it without a JavaScript polling timer. Custom surfaces
+without a readiness source use `idlePollMs` as a bounded fallback.
 
 ## Focus and terminal components
 
@@ -116,8 +126,24 @@ tracking. Known unsupported pixel-oriented properties increment diagnostics.
 - `colorMode: "truecolor"` preserves composited 24-bit RGB. The backend does
   not probe terminal color support.
 - `fps` defaults to 30 and must be an exact Pocket clock divisor: 1, 2, 3, 4,
-  5, 6, 10, 12, 15, 20, 30, or 60. The same value controls both the pump and
-  Pocket's virtual clock. `run()` does not pass a wall-clock delta to `onFrame`.
+  5, 6, 10, 12, 15, 20, 30, or 60. It is the fixed cadence or adaptive maximum
+  cadence and remains Pocket's deterministic virtual-clock step. Adaptive idle
+  time intentionally does not advance virtual time.
+- `onFrame` and `createSpriteAnimation` hold a continuous adaptive frame lease.
+  `after()` holds one only until its virtual deadline. `onDemandFrame()` keeps
+  the next frame when its callback returns `true`, while `requestFrame()` asks
+  for one explicit tick. Retained signal mutations wake independently.
+- The native watcher duplicates (but never reads) the tty descriptors, emits
+  one coalesced readiness edge, carries the parser-owned 25 ms standalone-Escape
+  deadline, and probes resize changes without waking JavaScript when dimensions
+  match. The readiness callback drains and rearms the parser immediately; it
+  does not advance Pocket's virtual clock. Completed input waits for the next
+  legal frame, where each resize is synchronized before its own `onInput`
+  callback and before button/frame dispatch.
+- That between-frame input queue is bounded to 4096 events and 2 MiB of UTF-8
+  text. Adjacent resize snapshots coalesce to the latest dimensions. Exceeding
+  either bound reports an error that remains fatal until close instead of
+  silently dropping ordered keys or paste chunks.
 - Each terminal button event produces one press frame and one release frame.
   Pending pulses are capped at eight. `directionPulsePolicy: "latest"` is the
   default and coalesces pending directions to the newest one, which avoids
@@ -147,8 +173,9 @@ calls explicitly.
 - font atlases are ignored.
 
 `session.diagnostics` counts those fallbacks and reports live nodes, HostOps
-mutations, rendered/skipped frames, latest run count, missing styles, and known
-unsupported properties.
+mutations, rendered/skipped frames, latest run count, missing styles, known
+unsupported properties, scheduler policy, stepped frames, idle waits, and wake
+signals.
 
 PocketJS 0.6 keeps its renderer root and frame handler in process-global state,
 so this package permits one active session per process. A concurrent mount
@@ -160,13 +187,18 @@ compatibility bridge because that release does not export its reset helper.
 ## PocketJS runtime surface
 
 The package re-exports the narrow PocketJS API needed by a TUI application:
-`BTN`, lifecycle hooks, focus APIs, Solid renderer helpers, `createSignal`,
+`BTN`, lifecycle hooks, `after`, focus APIs, Solid renderer helpers, `createSignal`,
 `createMemo`, and their corresponding types. Import reactive primitives from
 `@pocket-tui/pocketjs`, not directly from `solid-js`. The facade explicitly
 selects Solid's interactive client runtime even under Bun's default `node`
 export condition and owns its client root for exactly the Pocket mount
-lifetime. The executable adapter currently requires Bun because PocketJS 0.6's
-npm artifact publishes TypeScript source. Runtime calls always execute that
-pinned package. Local
-declarations pin the 0.6 contract so the dependency's shipped TypeScript
-sources do not inherit this workspace's stricter compiler settings.
+lifetime. Import lifecycle hooks and terminal components from this facade as
+well. Direct `@pocketjs/framework/components` imports are outside the adaptive
+scheduler contract in PocketJS 0.6 because they bind to upstream's bare-Solid
+lifecycle graph rather than this facade's client-owned lifecycle. Use the
+facade components and hooks; `framePolicy: "fixed"` only avoids a missed frame
+lease if an application must temporarily mix direct upstream imports.
+The executable adapter currently requires Bun because PocketJS 0.6's npm
+artifact publishes TypeScript source. Runtime calls always execute that pinned
+package. Local declarations pin the 0.6 contract so the dependency's shipped
+TypeScript sources do not inherit this workspace's stricter compiler settings.

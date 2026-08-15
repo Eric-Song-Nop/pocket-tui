@@ -1,6 +1,8 @@
 //! The only module coupled to the evolving core/terminal crates.
 
 use std::collections::{HashMap, HashSet};
+use std::os::fd::RawFd;
+use std::time::Instant;
 
 use pocket_tui_core::{
     Axis, BlockId, BoxNode, CanvasNode, CanvasRun as CoreCanvasRun, Color, DocumentId, Insets,
@@ -64,6 +66,14 @@ pub struct MemoryStatsSnapshot {
     pub terminal_pending_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct InputReadinessState {
+    pub input_fd: RawFd,
+    pub resize_fd: Option<RawFd>,
+    pub viewport: Size,
+    pub escape_deadline: Option<Instant>,
+}
+
 pub struct RuntimeAdapter {
     runtime: Runtime,
     bindings: HashMap<u64, Binding>,
@@ -74,13 +84,14 @@ pub struct RuntimeAdapter {
     cursor: CursorState,
     effect_bus: EffectBusState,
     pending_resize: Option<Size>,
+    resize_fd: Option<RawFd>,
     dirty: bool,
     last_sequence: u64,
 }
 
 impl Default for RuntimeAdapter {
     fn default() -> Self {
-        let reported = terminal_size();
+        let (reported, resize_fd) = terminal_size();
         let initial_size = if viewport_area(reported) <= MAX_VIEWPORT_CELLS {
             reported
         } else {
@@ -96,6 +107,7 @@ impl Default for RuntimeAdapter {
             cursor: CursorState::default(),
             effect_bus: EffectBusState::default(),
             pending_resize: None,
+            resize_fd,
             dirty: false,
             last_sequence: 0,
         }
@@ -244,6 +256,25 @@ impl RuntimeAdapter {
         Ok(events)
     }
 
+    /// Snapshot the descriptors and parser/model state used to arm readiness.
+    pub fn input_readiness_state(&self) -> Result<Option<InputReadinessState>, String> {
+        let Some(session) = self.session.as_ref() else {
+            return Ok(None);
+        };
+        let input_fd = session
+            .input_fd()
+            .map_err(|error| format!("failed to access terminal input descriptor: {error}"))?;
+        let escape_deadline = session
+            .input_escape_deadline()
+            .map_err(|error| format!("failed to access terminal input deadline: {error}"))?;
+        Ok(Some(InputReadinessState {
+            input_fd,
+            resize_fd: self.resize_fd,
+            viewport: self.runtime.size(),
+            escape_deadline,
+        }))
+    }
+
     /// Return the current terminal viewport, refreshing it from the tty first.
     pub fn viewport_size(&mut self) -> Result<Size, String> {
         self.refresh_terminal_size()?;
@@ -294,7 +325,10 @@ impl RuntimeAdapter {
     }
 
     fn refresh_terminal_size(&mut self) -> Result<(), String> {
-        self.apply_viewport_size(terminal_size(), true)
+        let (size, resize_fd) = terminal_size();
+        self.apply_viewport_size(size, true)?;
+        self.resize_fd = resize_fd;
+        Ok(())
     }
 
     fn apply_viewport_size(&mut self, size: Size, notify: bool) -> Result<(), String> {
@@ -916,8 +950,8 @@ fn descendants_including(bindings: &HashMap<u64, Binding>, root: u64) -> HashSet
         .collect()
 }
 
-fn terminal_size() -> Size {
-    choose_terminal_size(
+fn terminal_size() -> (Size, Option<RawFd>) {
+    choose_terminal_size_source(
         ioctl_terminal_size(libc::STDOUT_FILENO),
         ioctl_terminal_size(libc::STDIN_FILENO),
         env_dimension("COLUMNS"),
@@ -944,18 +978,25 @@ fn env_dimension(name: &str) -> Option<u16> {
         .filter(|value| *value > 0)
 }
 
-fn choose_terminal_size(
+fn choose_terminal_size_source(
     stdout: Option<Size>,
     stdin: Option<Size>,
     env_columns: Option<u16>,
     env_rows: Option<u16>,
-) -> Size {
-    stdout.or(stdin).unwrap_or_else(|| {
+) -> (Size, Option<RawFd>) {
+    if let Some(size) = stdout {
+        return (size, Some(libc::STDOUT_FILENO));
+    }
+    if let Some(size) = stdin {
+        return (size, Some(libc::STDIN_FILENO));
+    }
+    (
         Size::new(
             env_columns.unwrap_or(DEFAULT_VIEWPORT.columns),
             env_rows.unwrap_or(DEFAULT_VIEWPORT.rows),
-        )
-    })
+        ),
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -968,20 +1009,20 @@ mod tests {
         let stdin = Size::new(100, 30);
 
         assert_eq!(
-            choose_terminal_size(Some(stdout), Some(stdin), Some(90), Some(28)),
-            stdout
+            choose_terminal_size_source(Some(stdout), Some(stdin), Some(90), Some(28)),
+            (stdout, Some(libc::STDOUT_FILENO))
         );
         assert_eq!(
-            choose_terminal_size(None, Some(stdin), Some(90), Some(28)),
-            stdin
+            choose_terminal_size_source(None, Some(stdin), Some(90), Some(28)),
+            (stdin, Some(libc::STDIN_FILENO))
         );
         assert_eq!(
-            choose_terminal_size(None, None, Some(90), Some(28)),
-            Size::new(90, 28)
+            choose_terminal_size_source(None, None, Some(90), Some(28)),
+            (Size::new(90, 28), None)
         );
         assert_eq!(
-            choose_terminal_size(None, None, None, None),
-            Size::new(80, 24)
+            choose_terminal_size_source(None, None, None, None),
+            (Size::new(80, 24), None)
         );
     }
 

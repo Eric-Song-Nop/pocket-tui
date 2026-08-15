@@ -92,15 +92,48 @@ terminal receives the complete cell-rendered game without it.
 
 ## Input and frame contract
 
-`PocketTuiSession.run()` is currently a fixed-rate polling loop:
+`PocketTuiSession.run()` has two explicit scheduler policies:
 
 - `fps` defaults to 30 and accepts Pocket's exact clock divisors: 1, 2, 3, 4,
   5, 6, 10, 12, 15, 20, 30, or 60;
-- each step polls terminal input, runs one PocketJS frame, renders if the host
-  is dirty, and flushes with `"terminal"` semantics;
-- a clean host reuses its previous frame and increments `skippedFrames`, but
-  the session still wakes at the configured rate;
+- `framePolicy: "fixed"` is the compatibility default and advances at the
+  configured cadence using monotonic deadlines without catch-up storms;
+- `framePolicy: "adaptive"` treats `fps` as a maximum cadence and sleeps when
+  there is no input edge, button press/release, retained mutation, surface
+  command, continuous lifecycle lease, demand frame, or explicit request;
+- readiness drains and rearms the terminal parser immediately; the next legal
+  step delivers those cached events, runs exactly one PocketJS frame, renders
+  if the host is dirty, and flushes only when the surface has pending commands;
+- a clean host reuses its previous frame and increments `skippedFrames`;
 - the adapter does not pass a wall-clock delta into PocketJS `onFrame`.
+
+The real terminal surface arms a native one-shot readiness watcher after each
+drain. Its poll thread owns duplicated descriptors but never reads stdin;
+parser state stays under `RuntimeAdapter`'s single-owner mutex. It also carries
+the parser-owned standalone-Escape deadline and checks the authoritative output
+tty's viewport every 250 ms. An unchanged viewport only rearms the native
+deadline; JavaScript wakes when dimensions actually change. A custom surface
+without readiness falls back to `idlePollMs` (1000 ms by default).
+
+Public `onFrame` and `createSpriteAnimation` registrations hold a continuous
+adaptive lease. The facade's deterministic `after()` holds a lease through its
+virtual deadline. `onDemandFrame()` requests its next callback by returning
+`true`, and `requestFrame()` schedules one tick. Solid effects need no manual
+request: the first clean-to-dirty HostOps mutation is itself a wake source.
+Lifecycle hooks and components must come from `@pocket-tui/pocketjs` for that
+contract. Direct PocketJS 0.6 component imports use its bare-Solid lifecycle
+graph and remain outside this backend's lifecycle contract; `fixed` only avoids
+their missing adaptive lease while an application migrates to facade exports.
+Input readiness drains and rearms the native parser immediately, even while the
+maximum-cadence gate is closed. Completed typed and resize events are retained
+until the next legal Pocket frame; that separation preserves Escape parsing
+without accelerating virtual time, including edges delivered during an
+asynchronous flush. Each resize is applied before its own application input
+callback, and all queued resizes are applied before frame dispatch. The
+retained queue is capped at 4096 events and 2 MiB of UTF-8 text, coalesces
+adjacent resize snapshots, and fails explicitly on overflow rather than
+dropping ordered input. Because the overflowing batch has already left the
+surface, that failure remains fatal until the session closes.
 
 Terminal input is edge-based, so one mapped button pulse is followed by one
 release frame. The effective repeated-press rate is therefore at most half the
@@ -125,14 +158,19 @@ without changing Enter's START mapping elsewhere. A focused `TextInput`
 consumes text, paste chunks, editing keys, and submit before button mapping,
 and anchors the real terminal cursor after layout. Applications can replace
 button mapping with `mapInput` or inspect and consume events first with
-`onInput`. Resize events are applied when the fixed-rate input poll observes
-them.
+`onInput`. Each resize event synchronizes the Host viewport and both
+Pocket-owned root layers before that event's application callback runs; all
+queued resize events are applied before frame dispatch.
 
 For deterministic tests or external scheduling, call `session.step()` directly
-instead of `session.run()`.
+instead of `session.run()`. Steps are single-flight and cannot overlap the run
+loop. Closing waits for an already accepted step to reach its teardown-safe
+point; a step requested after close is rejected.
 
 The selected `fps` is published as Pocket's `__simHz` policy while mount
-latches its virtual clock, so one real pump second is one virtual second.
+latches its virtual clock. Fixed mode (and adaptive mode while a continuous
+lease is active) advances that many virtual frames per wall-clock second;
+adaptive idle deliberately pauses the deterministic virtual clock.
 PocketJS 0.6 keeps its renderer root and frame handler in process-global state;
 the adapter therefore allows one active session per process and fails a second
 mount before touching its surface. Normal close and failed-mount cleanup both
@@ -155,7 +193,8 @@ Pixel-oriented PocketJS operations have bounded terminal fallbacks:
 | Known unsupported style | Stores but does not paint the property | `unsupportedProperties` |
 
 `session.diagnostics` also reports live nodes, HostOps mutations, rendered and
-skipped frames, the latest compact run count, and missing style references.
+skipped frames, the latest compact run count, missing style references,
+`framePolicy`, `steppedFrames`, `idleWaits`, and `wakeSignals`.
 Signal Below exposes a small `HOST LINK` sample of these counters in its
 receiver rail so the retained backend is observable while playing.
 
@@ -172,6 +211,7 @@ const session = await mountPocketTui(() => App(), {
   },
   colorMode: ghostty ? "truecolor" : "ansi16",
   fps: 30,
+  framePolicy: "adaptive",
 });
 
 await session.run();

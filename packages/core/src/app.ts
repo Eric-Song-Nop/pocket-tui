@@ -234,7 +234,11 @@ export class TuiApp {
   #commands: Command[] = [];
   #native?: NativeTuiSession;
   #root?: SceneHandle;
-  #commitScheduled = false;
+  #nextCommitToken = 1;
+  #scheduledCommitToken?: number;
+  readonly #inputReadyListeners = new Set<() => void>();
+  #inputReadyInstalled = false;
+  #inputReadyGeneration = 0;
   #asyncError?: unknown;
 
   constructor(options: CreateTuiOptions = {}) {
@@ -249,6 +253,13 @@ export class TuiApp {
 
   get state(): TuiAppState {
     return this.#state;
+  }
+
+  /** Whether the loaded native binding can signal terminal input readiness. */
+  get inputReadySupported(): boolean {
+    this._assertOpen();
+    this.#throwAsyncError();
+    return this.#ensureNative().onInputReady !== undefined;
   }
 
   box(options: BoxPacketOptions = {}): BoxHandle {
@@ -356,12 +367,13 @@ export class TuiApp {
     this.#commitPending();
     native.start();
     this.#state = "active";
+    this.#installInputReady();
   }
 
   async flush(_mode: FlushMode = "terminal"): Promise<void> {
     this._assertOpen();
     this.#throwAsyncError();
-    this.#commitScheduled = false;
+    this.#scheduledCommitToken = undefined;
     this.#commitPending();
     this.#native?.flush();
   }
@@ -371,6 +383,30 @@ export class TuiApp {
     this._assertOpen();
     this.#throwAsyncError();
     return this.#native?.pollInput() ?? [];
+  }
+
+  /**
+   * Subscribe to a coalesced native stdin/resize readiness edge. Consumers
+   * must still call pollInput(); the callback never owns or parses input.
+   */
+  onInputReady(callback: () => void): () => void {
+    this._assertOpen();
+    this.#throwAsyncError();
+    if (typeof callback !== "function") {
+      throw new TypeError("TuiApp.onInputReady() requires a callback");
+    }
+    // A distinct registration keeps two subscriptions of the same callback
+    // independently disposable.
+    const listener = (): void => callback();
+    this.#inputReadyListeners.add(listener);
+    this.#installInputReady();
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.#inputReadyListeners.delete(listener);
+      if (this.#inputReadyListeners.size === 0) this.#clearInputReady();
+    };
   }
 
   /** Read the current terminal viewport in character cells. */
@@ -403,15 +439,25 @@ export class TuiApp {
 
   async close(): Promise<void> {
     if (this.#state === "closed") return;
-    this.#commitScheduled = false;
+    this.#scheduledCommitToken = undefined;
+    this.#inputReadyListeners.clear();
+    let failure: unknown;
     try {
+      this.#clearInputReady();
       this.#commitPending();
       this.#native?.flush();
-    } finally {
+    } catch (error) {
+      failure = error;
+    }
+    try {
       this.#native?.close();
+    } catch (error) {
+      failure = combineCleanupFailures(failure, error);
+    } finally {
       this.#state = "closed";
       this.#commands.length = 0;
     }
+    if (failure !== undefined) throw failure;
   }
 
   /** @internal */
@@ -493,10 +539,13 @@ export class TuiApp {
   #enqueue(command: Command): void {
     this._assertOpen();
     this.#commands.push(command);
-    if (this.#state === "active" && !this.#commitScheduled) {
-      this.#commitScheduled = true;
+    if (this.#state === "active" && this.#scheduledCommitToken === undefined) {
+      const commitToken = this.#nextCommitToken;
+      this.#nextCommitToken += 1;
+      this.#scheduledCommitToken = commitToken;
       queueMicrotask(() => {
-        this.#commitScheduled = false;
+        if (this.#scheduledCommitToken !== commitToken) return;
+        this.#scheduledCommitToken = undefined;
         if (this.#state !== "active") return;
         try {
           this.#commitPending();
@@ -530,6 +579,52 @@ export class TuiApp {
     return this.#native;
   }
 
+  #installInputReady(): void {
+    if (
+      this.#state !== "active" ||
+      this.#inputReadyInstalled ||
+      this.#inputReadyListeners.size === 0
+    ) {
+      return;
+    }
+    const native = this.#native;
+    if (native?.onInputReady === undefined) return;
+    const generation = this.#inputReadyGeneration + 1;
+    this.#inputReadyGeneration = generation;
+    this.#inputReadyInstalled = true;
+    try {
+      native.onInputReady(() => {
+        if (!this.#inputReadyInstalled || this.#inputReadyGeneration !== generation) return;
+        for (const listener of [...this.#inputReadyListeners]) {
+          try {
+            listener();
+          } catch (error) {
+            this.#asyncError ??= error;
+          }
+        }
+      });
+    } catch (error) {
+      if (this.#inputReadyGeneration === generation) {
+        this.#inputReadyInstalled = false;
+        this.#inputReadyGeneration += 1;
+      }
+      try {
+        native.clearInputReady?.();
+      } catch {
+        // Preserve the causal registration error while invalidating any
+        // partially installed native callback generation.
+      }
+      throw error;
+    }
+  }
+
+  #clearInputReady(): void {
+    if (!this.#inputReadyInstalled) return;
+    this.#inputReadyInstalled = false;
+    this.#inputReadyGeneration += 1;
+    this.#native?.clearInputReady?.();
+  }
+
   #throwAsyncError(): void {
     if (this.#asyncError === undefined) return;
     const error = this.#asyncError;
@@ -544,6 +639,15 @@ function environmentViewportSize(): NativeViewportSize {
     return Number.isInteger(value) && value > 0 && value <= 0xffff ? value : fallback;
   };
   return { columns: dimension("COLUMNS", 80), rows: dimension("LINES", 24) };
+}
+
+function combineCleanupFailures(first: unknown, second: unknown): unknown {
+  if (first === undefined) return second;
+  return new AggregateError(
+    [first, second],
+    "TuiApp flush failed and native terminal cleanup also failed",
+    { cause: first },
+  );
 }
 
 export function createTui(options: CreateTuiOptions = {}): TuiApp {

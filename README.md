@@ -32,13 +32,13 @@ The MVP is intentionally narrower than the complete design in [`docs/architectur
 
 ### Input and public API
 
-- Nonblocking input polling for UTF-8 text, basic control and arrow keys, bracketed paste, and coalesced viewport changes.
+- Nonblocking input draining for UTF-8 text, basic control and arrow keys, bracketed paste, and coalesced viewport changes, plus a one-shot native readiness edge that never reads or owns parser bytes.
 - A bounded incremental decoder: 64 KiB maximum undecoded input and 16 KiB paste chunks by default.
-- A stable N-API v8 boundary for submit/start/flush/input/stats/close.
+- A stable N-API v8 boundary for submit/start/flush/readiness/input/stats/close.
 - TypeScript handles for `TuiApp`, `Box`, `Text`, native transcripts, transcript blocks, and virtual transcript views.
 - A fixed-size `CellBuffer` that compacts adjacent equal-style cells into Canvas row runs; Canvas frames stay inside the versioned PTX transaction and native damage pipeline rather than embedding ANSI in strings.
 - Live viewport dimensions from `TIOCGWINSZ`, resize events coalesced through input polling, a one-million-cell allocation safety limit, and explicit final cursor position/color state for IME- and shader-style integrations.
-- Automatic microtask batching into PTX packets, native artifact loading, explicit flush/close, and memory statistics.
+- Automatic microtask batching into PTX packets, generation-safe explicit flush/close, native artifact loading, and memory statistics.
 
 ### PocketJS 0.6 reference backend
 
@@ -48,7 +48,7 @@ The MVP is intentionally narrower than the complete design in [`docs/architectur
   grapheme-aware `TextInput` components with a real cursor anchor.
 - Host mutations are laid out in terminal cells and rasterized into compact, terminal-independent Canvas runs. The backend—not the game—owns `CanvasHandle.present()`, PTX1 transport, and the handoff to Rust damage tracking.
 - The reference backend supports an explicit conservative `ansi16` mode and an opt-in `truecolor` mode. It does not probe terminal color capabilities.
-- Terminal input becomes bounded Pocket button pulses, with a latest-direction policy for real-time apps or an ordered queue for turn-based apps, plus one release frame after each press. The session is currently a fixed-rate loop rather than the target event-driven scheduler.
+- Terminal input becomes bounded Pocket button pulses, with a latest-direction policy for real-time apps or an ordered queue for turn-based apps, plus one release frame after each press. Sessions offer compatibility-first fixed cadence or opt-in adaptive scheduling driven by native input/resize readiness, retained mutations, frame leases, and explicit requests.
 - Pixel-only PocketJS features degrade explicitly: images use a placeholder, textures and sprites are unsupported, font atlases are ignored, and timed animation resolves immediately to its endpoint. Diagnostics count every fallback.
 
 See [`docs/pocketjs-backend.md`](docs/pocketjs-backend.md) for the complete data path, supported subset, frame/input contract, and degradation behavior.
@@ -183,8 +183,8 @@ docs/pocketjs-backend.md      current backend data path and compatibility limits
 - Transcript indexing is a compact logical-line summary, not the planned width-aware B+ height index. There is no sealed-block compression, disk spill, eviction, or provider reload yet.
 - Transcript lines are tail-clipped to the viewport width rather than fully reflowed into cached wrapped rows.
 - Terminal capabilities are conservative ANSI16 by default and may be set explicitly to truecolor; the flagship demo makes that choice only for its opt-in Ghostty path. Capabilities are not actively probed. Main-screen-safe cursor planning, scroll-operation cost planning, Kitty keyboard, mouse/focus/IME, OSC 8, synchronized-update negotiation, and Kitty/Sixel images remain roadmap work.
-- Resize changes are detected while JavaScript polls input; there is not yet an edge-triggered SIGWINCH event producer. Canvas currently submits bounded full semantic frames, after which native row damage still limits terminal output; sparse Canvas patch opcodes are future work.
-- Input delivery is polled by JavaScript; the planned bounded native event ring and edge-trigger notification path are not present yet.
+- Resize readiness currently uses a native 250 ms `TIOCGWINSZ` change probe rather than an edge-triggered SIGWINCH producer. Unchanged probes stay entirely native and do not wake JavaScript. Canvas still submits bounded full semantic frames, after which native row damage limits terminal output; sparse Canvas patch opcodes are future work.
+- Input bytes are still drained on the JavaScript-owned `pollInput()` boundary immediately after a one-shot native readiness signal; completed events are bounded between Pocket frames to 4096 entries and 2 MiB of UTF-8 text, but the planned native event ring is not present yet.
 - PTX currently uses copied `Uint8Array` packets; SharedArrayBuffer transport and the full byte-budgeted scheduler are later milestones.
 - Packaging and automated coverage are still development-grade. `prepack` builds
   the native artifact for the current host so a source checkout can produce a

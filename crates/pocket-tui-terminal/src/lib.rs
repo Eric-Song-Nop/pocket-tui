@@ -8,6 +8,7 @@ mod capability;
 mod encoder;
 mod guard;
 mod input;
+mod readiness;
 mod session;
 mod state;
 mod transport;
@@ -19,6 +20,7 @@ pub use input::{
     InputError, InputEvent, InputLimits, InputParser, KeyCode, KeyEvent, KeyModifiers,
     TerminalInput,
 };
+pub use readiness::{InputReadinessArm, InputReadinessWatcher, InputReadyReason};
 pub use session::{SessionProgress, TerminalError, TerminalSession};
 pub use state::{CursorShape, CursorState, EffectBusState, PhysicalState};
 pub use transport::FdWriter;
