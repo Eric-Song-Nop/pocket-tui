@@ -1,5 +1,6 @@
 import type { ComputedStyle, HostNode, LayoutEntry, LayoutResult, Rect } from "./model.js";
 import { ENUM, NODE, SIZE_FULL } from "./spec.js";
+import { beginMapTransaction } from "./transaction-map.js";
 import { textExtent } from "./unicode.js";
 
 export type StyleResolver = (node: HostNode) => ComputedStyle;
@@ -161,14 +162,30 @@ export function layoutAbsoluteSubtreeCached(
 function createLayoutEngine(resolveStyle: StyleResolver, options: LayoutEngineOptions = {}): LayoutEngine {
   const entries = options.partial
     ? new Map<number, LayoutEntry>()
-    : new Map<number, LayoutEntry>(options.previous?.entries);
+    : options.previous === undefined
+      ? new Map<number, LayoutEntry>()
+      : beginMapTransaction(options.previous.entries);
   const flattenedText = options.partial
     ? new Map<number, string>()
-    : new Map<number, string>(options.previous?.flattenedText);
-  const measurements = new Map<number, MeasurementBucket>(options.cache?.measurements);
-  const geometryRevisions = new Map<number, number>(options.cache?.geometryRevisions);
-  const textRevisions = new Map<number, number>(options.cache?.textRevisions);
-  const subtreeEntryCounts = new Map<number, number>(options.cache?.subtreeEntryCounts);
+    : options.previous === undefined
+      ? new Map<number, string>()
+      : beginMapTransaction(options.previous.flattenedText);
+  const measurements =
+    options.cache === undefined
+      ? new Map<number, MeasurementBucket>()
+      : beginMapTransaction(options.cache.measurements);
+  const geometryRevisions =
+    options.cache === undefined
+      ? new Map<number, number>()
+      : beginMapTransaction(options.cache.geometryRevisions);
+  const textRevisions =
+    options.cache === undefined
+      ? new Map<number, number>()
+      : beginMapTransaction(options.cache.textRevisions);
+  const subtreeEntryCounts =
+    options.cache === undefined
+      ? new Map<number, number>()
+      : beginMapTransaction(options.cache.subtreeEntryCounts);
   let laidOutNodes = 0;
   let reusedNodes = 0;
   const measuredNodeIds = new Set<number>();
