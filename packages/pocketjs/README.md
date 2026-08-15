@@ -109,14 +109,19 @@ frame without layout or raster work. Paint-only mutations (`overflow`,
 `zIndex`, background/opacity/border paint, and text color/alignment/tracking)
 reuse the last cell geometry and flattened text. The backend refreshes computed
 styles, unions the previous row bounds of every changed subtree, and replays the
-scene only into those rows; unaffected compact runs are retained. Geometry,
-text, tree, style-reference/table, focus, and active-state changes still use
-full layout and bounded viewport rasterization as the correctness oracle.
+scene only into those rows; unaffected compact runs are retained. Geometry and
+text mutations below an absolute-positioned node reuse its cached parent and
+run the same layout solver only for the nearest isolated absolute subtree. The
+damage set includes both its old and new subtree rows. Multiple roots coalesce,
+while flow layout, tree, style-reference/table, focus, active-state, and resize
+changes fall back to full layout and bounded viewport rasterization as the
+correctness oracle.
 
-This is incremental JavaScript paint, but it is not yet local Flex reflow or
-sparse Canvas transport. Every rendered frame still submits a complete semantic
-`CanvasFrame`; Rust persistent row damage limits the actual terminal output
-downstream.
+This is incremental JavaScript layout and paint for absolute islands, but it is
+not yet general local Flex reflow or sparse Canvas transport. Rasterization
+still traverses the retained scene for paint order, but materializes only dirty
+rows. Every rendered frame submits a complete semantic `CanvasFrame`; Rust
+persistent row damage limits the actual terminal output downstream.
 
 The implemented style subset includes cell flex row/column layout,
 grow/shrink/basis, padding/margin/gap, absolute positioning, clipping, z-order,
@@ -178,9 +183,9 @@ calls explicitly.
 
 `session.diagnostics` counts those fallbacks and reports live nodes, HostOps
 mutations, rendered/skipped frames, full versus incremental raster frames,
-layout passes/reused-layout frames, repainted rows, latest run count, missing
-styles, known unsupported properties, scheduler policy, stepped frames, idle
-waits, and wake signals.
+full/localized/reused layout frames, recomputed layout nodes/roots, repainted
+rows, latest run count, missing styles, known unsupported properties, scheduler
+policy, stepped frames, idle waits, and wake signals.
 
 PocketJS 0.6 keeps its renderer root and frame handler in process-global state,
 so this package permits one active session per process. A concurrent mount

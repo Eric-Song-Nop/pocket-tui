@@ -98,6 +98,8 @@ describe("Signal Below PocketJS backend integration", () => {
       const playerNode = textNodeId(host.snapshot(), "◉");
       const headingNode = textNodeId(host.snapshot(), "RETURN CARRIER");
       const mutations = host.diagnostics.mutations;
+      const layoutBaseline = host.diagnostics;
+      const retainedLayoutNodes = host.snapshot().filter((node) => node.rect !== undefined).length;
 
       // A terminal event becomes a Pocket button edge. The game reacts from
       // onButtonPress; Pocket delivers signal effects on the following frame,
@@ -112,6 +114,12 @@ describe("Signal Below PocketJS backend integration", () => {
       expect(textNodeId(host.snapshot(), "◉")).toBe(playerNode);
       expect(textNodeId(host.snapshot(), "RETURN CARRIER")).toBe(headingNode);
       expect(host.diagnostics.mutations).toBeGreaterThan(mutations);
+      expect(host.diagnostics.fullLayoutFrames).toBe(layoutBaseline.fullLayoutFrames);
+      const localizedFrames =
+        host.diagnostics.localizedLayoutFrames - layoutBaseline.localizedLayoutFrames;
+      const localizedNodes = host.diagnostics.layoutNodes - layoutBaseline.layoutNodes;
+      expect(localizedFrames).toBeGreaterThan(0);
+      expect(localizedNodes / (localizedFrames * retainedLayoutNodes)).toBeLessThan(0.25);
     } finally {
       await session?.close();
     }

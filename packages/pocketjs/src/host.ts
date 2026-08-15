@@ -9,7 +9,7 @@ import type {
   TuiViewportSize,
 } from "@pocket-tui/core";
 
-import { layoutTree } from "./layout.js";
+import { layoutAbsoluteSubtree, layoutTree } from "./layout.js";
 import type { ComputedStyle, HostNode, LayoutEntry, LayoutResult, Rect } from "./model.js";
 import { rasterize, type PocketTuiColorMode } from "./raster.js";
 import {
@@ -42,6 +42,37 @@ const PAINT_ONLY_PROPERTIES = new Set<number>([
   PROP.tracking,
 ]);
 
+const LAYOUT_PROPERTIES = new Set<number>([
+  PROP.width,
+  PROP.height,
+  PROP.minW,
+  PROP.minH,
+  PROP.maxW,
+  PROP.maxH,
+  PROP.paddingT,
+  PROP.paddingR,
+  PROP.paddingB,
+  PROP.paddingL,
+  PROP.marginT,
+  PROP.marginR,
+  PROP.marginB,
+  PROP.marginL,
+  PROP.gap,
+  PROP.flexDir,
+  PROP.justify,
+  PROP.align,
+  PROP.grow,
+  PROP.shrink,
+  PROP.basis,
+  PROP.posType,
+  PROP.insetT,
+  PROP.insetR,
+  PROP.insetB,
+  PROP.insetL,
+  PROP.display,
+  PROP.lineHeight,
+]);
+
 export interface PocketTuiHostOptions {
   /** An injectable surface keeps HostOps contract tests independent of a TTY. */
   surface?: PocketTuiSurface;
@@ -61,8 +92,18 @@ export interface PocketTuiHostDiagnostics {
   readonly skippedFrames: number;
   /** Successful frames that recomputed cell geometry. */
   readonly layoutPasses: number;
-  /** Successful paint-only frames that reused the previous geometry. */
+  /** Successful frames that ran layout from the viewport root. */
+  readonly fullLayoutFrames: number;
+  /** Successful frames that recomputed isolated absolute subtrees. */
+  readonly localizedLayoutFrames: number;
+  /** Successful frames that reused all previous geometry. */
   readonly reusedLayoutFrames: number;
+  /** Entries recomputed by the most recently presented layout frame. */
+  readonly lastLayoutNodes: number;
+  /** Total entries recomputed by successfully presented layout frames. */
+  readonly layoutNodes: number;
+  /** Isolated roots recomputed by the most recently presented frame. */
+  readonly lastRelayoutRoots: number;
   /** Successful frames rasterized across the complete viewport. */
   readonly fullRasterFrames: number;
   /** Successful frames rasterized only across affected rows. */
@@ -109,7 +150,12 @@ interface MutableDiagnostics {
   renderedFrames: number;
   skippedFrames: number;
   layoutPasses: number;
+  fullLayoutFrames: number;
+  localizedLayoutFrames: number;
   reusedLayoutFrames: number;
+  lastLayoutNodes: number;
+  layoutNodes: number;
+  lastRelayoutRoots: number;
   fullRasterFrames: number;
   incrementalRasterFrames: number;
   lastRepaintedRows: number;
@@ -122,6 +168,13 @@ interface MutableDiagnostics {
   unsupportedSprites: number;
   collapsedAnimations: number;
   ignoredFontAtlases: number;
+}
+
+interface LocalizedLayoutResult {
+  readonly layout: LayoutResult;
+  readonly dirtyRows: Set<number>;
+  readonly roots: readonly HostNode[];
+  readonly layoutNodes: number;
 }
 
 export class PocketTuiHost {
@@ -138,7 +191,12 @@ export class PocketTuiHost {
     renderedFrames: 0,
     skippedFrames: 0,
     layoutPasses: 0,
+    fullLayoutFrames: 0,
+    localizedLayoutFrames: 0,
     reusedLayoutFrames: 0,
+    lastLayoutNodes: 0,
+    layoutNodes: 0,
+    lastRelayoutRoots: 0,
     fullRasterFrames: 0,
     incrementalRasterFrames: 0,
     lastRepaintedRows: 0,
@@ -157,7 +215,8 @@ export class PocketTuiHost {
   #focused = 0;
   #nextAnimation = 1;
   #viewport: TuiViewportSize;
-  #dirty: "full" | "paint" | undefined = "full";
+  #dirty: "full" | "layout" | "paint" | undefined = "full";
+  readonly #layoutDirtyNodes = new Set<HostNode>();
   readonly #paintDirtyNodes = new Set<HostNode>();
   #mutationRevision = 0;
   #surfacePending = false;
@@ -397,22 +456,47 @@ export class PocketTuiHost {
       return this.#lastFrame;
     }
     const previousLayout = this.#lastLayout;
-    const full = force || pending !== "paint" || previousLayout === undefined;
+    let renderKind: "full" | "localized" | "reuse";
     let layout: LayoutResult;
     let dirtyRows: Set<number> | undefined;
-    if (full) {
+    let layoutNodes = 0;
+    let relayoutRoots = 0;
+    if (force || pending === "full" || previousLayout === undefined) {
+      renderKind = "full";
       layout = layoutTree(
         this.#root,
         this.#viewport.columns,
         this.#viewport.rows,
         (node) => this.#computedStyle(node),
       );
+      layoutNodes = layout.entries.size;
+      relayoutRoots = 1;
+    } else if (pending === "layout") {
+      const localized = this.#localizedLayout(previousLayout);
+      if (localized === undefined) {
+        renderKind = "full";
+        layout = layoutTree(
+          this.#root,
+          this.#viewport.columns,
+          this.#viewport.rows,
+          (node) => this.#computedStyle(node),
+        );
+        layoutNodes = layout.entries.size;
+        relayoutRoots = 1;
+      } else {
+        renderKind = localized.roots.length === 0 ? "reuse" : "localized";
+        layout = localized.layout;
+        dirtyRows = localized.dirtyRows;
+        layoutNodes = localized.layoutNodes;
+        relayoutRoots = localized.roots.length;
+      }
     } else {
-      // `full` includes the missing-cache case, so the paint path always has
-      // committed geometry and text to reuse.
+      renderKind = "reuse";
+      // The missing-cache case is handled above, so retained geometry and text
+      // are always available here.
       if (previousLayout === undefined) throw new Error("PocketTUI: missing retained layout");
       layout = this.#refreshLayoutStyles(previousLayout);
-      dirtyRows = this.#collectDirtyRows(previousLayout);
+      dirtyRows = this.#collectDirtyRows(previousLayout, layout);
     }
     const raster = rasterize(
       this.#root,
@@ -420,7 +504,7 @@ export class PocketTuiHost {
       this.#viewport.columns,
       this.#viewport.rows,
       this.#colorMode,
-      full
+      renderKind === "full"
         ? undefined
         : {
             previousFrame: this.#lastFrame,
@@ -445,17 +529,26 @@ export class PocketTuiHost {
     const retainedRenderWork = mutationRevision !== this.#mutationRevision;
     if (!retainedRenderWork) {
       this.#dirty = undefined;
+      this.#layoutDirtyNodes.clear();
       this.#paintDirtyNodes.clear();
     }
     this.#stats.renderedFrames += 1;
-    if (full) {
+    if (renderKind === "full") {
       this.#stats.layoutPasses += 1;
+      this.#stats.fullLayoutFrames += 1;
       this.#stats.fullRasterFrames += 1;
+    } else if (renderKind === "localized") {
+      this.#stats.layoutPasses += 1;
+      this.#stats.localizedLayoutFrames += 1;
+      this.#stats.incrementalRasterFrames += 1;
     } else {
       this.#stats.reusedLayoutFrames += 1;
       this.#stats.incrementalRasterFrames += 1;
     }
-    const repaintedRows = full ? raster.frame.height : (dirtyRows?.size ?? 0);
+    this.#stats.lastLayoutNodes = layoutNodes;
+    this.#stats.layoutNodes += layoutNodes;
+    this.#stats.lastRelayoutRoots = relayoutRoots;
+    const repaintedRows = renderKind === "full" ? raster.frame.height : (dirtyRows?.size ?? 0);
     this.#stats.lastRepaintedRows = repaintedRows;
     this.#stats.repaintedRows += repaintedRows;
     this.#stats.lastRunCount = raster.frame.runs.length;
@@ -627,6 +720,8 @@ export class PocketTuiHost {
     if (!SUPPORTED_PROPS.has(property)) this.#stats.unsupportedProperties += 1;
     if (PAINT_ONLY_PROPERTIES.has(property)) {
       this.#markPaintMutation(node);
+    } else if (LAYOUT_PROPERTIES.has(property)) {
+      this.#markLayoutMutation(node);
     } else {
       this.#markMutation();
     }
@@ -639,7 +734,7 @@ export class PocketTuiHost {
     if (typeof value !== "string") throw new TypeError("PocketTUI: text must be a string");
     if (node.text === value) return;
     node.text = value;
-    this.#markMutation();
+    this.#markLayoutMutation(node);
   }
 
   #uploadTexture(bytes: Uint8Array, width: number, height: number, psm: number): number {
@@ -815,8 +910,90 @@ export class PocketTuiHost {
     return { entries, flattenedText: previous.flattenedText };
   }
 
-  #collectDirtyRows(layout: LayoutResult): Set<number> {
-    const rows = new Set<number>();
+  /**
+   * Recompute layout below absolute-positioned isolation roots. Absolute
+   * children do not contribute to their parent's Flex measurement, so their
+   * geometry may change without invalidating the cached parent or siblings.
+   * Any connected dirty source without such a boundary falls back to the full
+   * layout oracle by returning undefined.
+   */
+  #localizedLayout(previous: LayoutResult): LocalizedLayoutResult | undefined {
+    const candidates = new Set<HostNode>();
+    for (const source of this.#layoutDirtyNodes) {
+      if (!isAncestor(this.#root, source)) continue;
+      let current: HostNode | null = source;
+      let candidate: HostNode | undefined;
+      while (current !== null) {
+        const oldEntry = previous.entries.get(current.id);
+        if (
+          oldEntry !== undefined &&
+          oldEntry.style.position === ENUM.absolute &&
+          this.#computedStyle(current).position === ENUM.absolute
+        ) {
+          const parent = current.parent;
+          if (
+            parent !== null &&
+            parent.type === NODE.view &&
+            previous.entries.has(parent.id)
+          ) {
+            candidate = current;
+          }
+          break;
+        }
+        current = current.parent;
+      }
+      if (candidate === undefined) return undefined;
+      candidates.add(candidate);
+    }
+
+    const roots = [...candidates].filter(
+      (candidate) =>
+        ![...candidates].some(
+          (other) => other !== candidate && isAncestor(other, candidate),
+        ),
+    );
+    const entries = new Map(previous.entries);
+    const flattenedText = new Map(previous.flattenedText);
+    const dirtyRows = new Set<number>();
+    let layoutNodes = 0;
+
+    for (const root of roots) {
+      this.#collectSubtreeRows(root, previous, dirtyRows);
+      visitSubtree(root, (node) => {
+        entries.delete(node.id);
+        flattenedText.delete(node.id);
+      });
+
+      const parent = root.parent;
+      const parentEntry = parent === null ? undefined : previous.entries.get(parent.id);
+      if (parentEntry === undefined) return undefined;
+      const partial = layoutAbsoluteSubtree(root, parentEntry, (node) =>
+        this.#computedStyle(node),
+      );
+      for (const [id, entry] of partial.entries) entries.set(id, entry);
+      for (const [id, value] of partial.flattenedText) flattenedText.set(id, value);
+      layoutNodes += partial.entries.size;
+      this.#collectSubtreeRows(root, partial, dirtyRows);
+    }
+
+    const layout = this.#refreshLayoutStyles({ entries, flattenedText });
+    this.#collectDirtyRows(previous, layout, dirtyRows);
+    return { layout, dirtyRows, roots, layoutNodes };
+  }
+
+  #collectDirtyRows(
+    previous: LayoutResult,
+    current: LayoutResult,
+    rows = new Set<number>(),
+  ): Set<number> {
+    for (const node of this.#paintDirtyNodes) {
+      this.#collectSubtreeRows(node, previous, rows);
+      this.#collectSubtreeRows(node, current, rows);
+    }
+    return rows;
+  }
+
+  #collectSubtreeRows(node: HostNode, layout: LayoutResult, rows: Set<number>): void {
     const visited = new Set<number>();
     const collect = (node: HostNode): void => {
       if (visited.has(node.id)) return;
@@ -829,8 +1006,7 @@ export class PocketTuiHost {
       }
       for (const child of node.children) collect(child);
     };
-    for (const node of this.#paintDirtyNodes) collect(node);
-    return rows;
+    collect(node);
   }
 
   #node(id: number): HostNode {
@@ -871,7 +1047,19 @@ export class PocketTuiHost {
   #markMutation(): void {
     const wasClean = this.#dirty === undefined;
     this.#dirty = "full";
+    this.#layoutDirtyNodes.clear();
     this.#paintDirtyNodes.clear();
+    this.#mutationRevision += 1;
+    this.#stats.mutations += 1;
+    if (wasClean) this.#notifyWorkNeeded();
+  }
+
+  #markLayoutMutation(node: HostNode): void {
+    const wasClean = this.#dirty === undefined;
+    if (this.#dirty !== "full") {
+      this.#dirty = "layout";
+      this.#layoutDirtyNodes.add(node);
+    }
     this.#mutationRevision += 1;
     this.#stats.mutations += 1;
     if (wasClean) this.#notifyWorkNeeded();
@@ -880,7 +1068,7 @@ export class PocketTuiHost {
   #markPaintMutation(node: HostNode): void {
     const wasClean = this.#dirty === undefined;
     if (this.#dirty !== "full") {
-      this.#dirty = "paint";
+      if (this.#dirty === undefined) this.#dirty = "paint";
       this.#paintDirtyNodes.add(node);
     }
     this.#mutationRevision += 1;
@@ -957,6 +1145,11 @@ function isAncestor(candidate: HostNode, node: HostNode): boolean {
     current = current.parent;
   }
   return false;
+}
+
+function visitSubtree(node: HostNode, visit: (node: HostNode) => void): void {
+  visit(node);
+  for (const child of node.children) visitSubtree(child, visit);
 }
 
 function depth(node: HostNode): number {
