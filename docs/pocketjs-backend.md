@@ -24,7 +24,7 @@ createNode · insertBefore · setProp · replaceText · setFocus · ...
         ▼
 @pocket-tui/pocketjs
 validated retained shadow tree · style resolution · cell layout
-viewport raster · ANSI16/truecolor conversion · styled-run compaction
+retained paint/row index · bounded raster candidates · styled-run compaction
         │
         │ CanvasFrame + exact dirty-row hint
         ▼
@@ -60,15 +60,25 @@ Cache-aware Flex reduces solver work but still scans direct siblings on dirty
 ancestor paths. Layout, flattened-text, measurement, and revision candidates
 use copy-on-write transaction maps: failed presents discard their patches, and
 successful presents apply only touched keys to the last confirmed maps. Those
-same touched keys bound old/new layout damage comparison. Rasterization still
-traverses the full scene to rebuild paint order and retains a complete semantic
-`CanvasFrame` in JavaScript. Incremental paths also provide the exact dirty-row
-set. Core emits PTX1 whole-row replacements when the native feature bit is
-present and the aligned patch record is smaller than the full record. Each
-patch names the exact retained Canvas revision and dimensions; first frames,
-resizes, dense changes, and older native artifacts fall back to complete
-frames. Rust then compares persistent rows and emits only actual terminal
-damage.
+same touched keys bound old/new layout damage comparison.
+
+Full frames construct the retained paint index while the recursive raster stays
+the rendering oracle. An incremental frame transactionally replaces only
+affected structural subtrees. Index records own copied rectangles/styles plus
+effective ancestor clip and opacity; sparse segment-row buckets select raster
+and hit-test candidates in retained global paint order. Ordinary geometry and
+paint changes therefore avoid a full Host-node traversal. A change to painted
+membership or z/document order still rebuilds the global order, and full/forced
+frames verify the index against recursive raster output. JavaScript still retains a complete
+semantic `CanvasFrame`, and row compaction plus transport selection scan its
+complete run set.
+
+Incremental paths provide the exact dirty-row set. Core emits PTX1 whole-row
+replacements when the native feature bit is present and the aligned patch
+record is smaller than the full record. Each patch names the exact retained
+Canvas revision and dimensions; first frames, resizes, dense changes, and older
+native artifacts fall back to complete frames. Rust then compares persistent
+rows and emits only actual terminal damage.
 
 ## Current retained model
 
@@ -216,8 +226,10 @@ Pixel-oriented PocketJS operations have bounded terminal fallbacks:
 `session.diagnostics` also reports live nodes, HostOps mutations, rendered and
 skipped frames, full/cached/localized/reused layout frames,
 recomputed/measured/reused layout nodes, relayout roots, full and incremental
-raster frames, last/total repainted rows, the latest compact run count, missing
-style references, `framePolicy`, `steppedFrames`, `idleWaits`, and `wakeSignals`.
+raster frames, full/incremental/reused paint-index frames, rebuilt index
+nodes/roots, global paint-order rebuilds, raster candidates, last/total
+repainted rows, the latest compact run count, missing style references,
+`framePolicy`, `steppedFrames`, `idleWaits`, and `wakeSignals`.
 Signal Below exposes a small `HOST LINK` sample of these counters in its
 receiver rail so the retained backend is observable while playing.
 

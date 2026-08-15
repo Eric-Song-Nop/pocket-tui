@@ -109,11 +109,11 @@ frame without layout or raster work. Paint-only mutations (`overflow`,
 `zIndex`, background/opacity/border paint, and text color/alignment/tracking)
 reuse the last cell geometry and flattened text. The backend refreshes computed
 styles only for changed entries, unions the previous row bounds of every
-changed subtree, and replays the scene only into those rows; unaffected compact
-runs are retained. Geometry and text mutations below an absolute-positioned
-node reuse its cached parent and run the same layout solver only for the nearest
-isolated absolute subtree. Other row/column Flex mutations run a cache-aware
-root pass: every retained subtree carries a monotonic layout revision,
+changed subtree, and queries retained paint candidates only for those rows;
+unaffected compact runs are retained. Geometry and text mutations below an
+absolute-positioned node reuse its cached parent and run the same layout solver
+only for the nearest isolated absolute subtree. Other row/column Flex mutations
+run a cache-aware root pass: every retained subtree carries a monotonic layout revision,
 measurements are keyed by the exact available width and height, same-size clean
 subtrees retain their geometry, and moved clean subtrees translate as a unit.
 The damage set compares old/new geometry and text, including fixed rectangles
@@ -121,20 +121,28 @@ whose line height changes. Tree, style-reference/table, focus, active-state,
 and resize changes retain full layout and bounded viewport rasterization as the
 correctness oracle.
 
-This removes repeated Flex measurement and layout work, but is not yet an
-end-to-end O(delta) renderer. A cached root pass still scans direct Flex
-siblings. Frame candidates now write changed layout, text, measurement, and
-revision records into copy-on-write transaction maps; a successful
+This removes repeated Flex measurement, layout, and full-scene paint traversal,
+but is not yet an end-to-end O(delta) renderer. A cached root pass still scans
+direct Flex siblings. Frame candidates write changed layout, text, measurement,
+and revision records into copy-on-write transaction maps; a successful
 `surface.present()` commits only those patches into the retained maps, while a
 failed present discards them intact. Transaction touched keys also drive layout
-damage comparison without a full map union. Rasterization still traverses the
-retained scene to rebuild paint order even though it rerasterizes only dirty
-rows. The surface retains a complete semantic `CanvasFrame`, but incremental
-frames pass their exact dirty-row set to `@pocket-tui/core`. When the native
-artifact advertises support and the aligned PTX record is smaller, core sends
-revision-guarded whole-row replacements; first frames, resizes, dense changes,
-and older native artifacts use a complete frame. Rust persistent row damage
-then limits the actual terminal output downstream.
+damage comparison without a full map union.
+
+Full frames build a retained paint index from the recursive scene oracle.
+Incremental frames replace only affected index subtrees. Each copied record
+owns its effective ancestor clip and opacity, while sparse segment-row indexes
+bound both raster candidates and hit testing. Exact paint membership and
+z/document order are retained; only a membership or ordering change rebuilds
+the global order. Incremental rasterization therefore visits candidate records
+for affected rows instead of traversing every Host node. The surface still
+retains a complete semantic `CanvasFrame`, and compaction plus PTX byte
+selection still scan that complete run set. Incremental frames pass their exact
+dirty-row set to `@pocket-tui/core`; when the native artifact advertises support
+and the aligned PTX record is smaller, core sends revision-guarded whole-row
+replacements. First frames, resizes, dense changes, and older native artifacts
+use a complete frame. Rust persistent row damage then limits the actual
+terminal output downstream.
 
 The implemented style subset includes cell flex row/column layout,
 grow/shrink/basis, padding/margin/gap, absolute positioning, clipping, z-order,
@@ -197,9 +205,10 @@ calls explicitly.
 `session.diagnostics` counts those fallbacks and reports live nodes, HostOps
 mutations, rendered/skipped frames, full versus incremental raster frames,
 full/cached/localized/reused layout frames, recomputed/measured/reused layout
-nodes, relayout roots, repainted rows, latest run count, missing styles, known
-unsupported properties, scheduler policy, stepped frames, idle waits, and wake
-signals.
+nodes, relayout roots, full/incremental/reused paint-index frames, rebuilt index
+nodes/roots, paint-order rebuilds, raster candidates, repainted rows, latest run
+count, missing styles, known unsupported properties, scheduler policy, stepped
+frames, idle waits, and wake signals.
 
 PocketJS 0.6 keeps its renderer root and frame handler in process-global state,
 so this package permits one active session per process. A concurrent mount

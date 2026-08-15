@@ -38,6 +38,36 @@ export interface RasterOptions {
   readonly dirtyRows?: ReadonlySet<number>;
 }
 
+/**
+ * Immutable paint data captured from the retained scene.
+ *
+ * `clip` is the node rectangle after every ancestor overflow clip has been
+ * applied. `opacity` is the node opacity multiplied by every ancestor
+ * opacity. Keeping both values on the record lets indexed rasterization avoid
+ * walking `HostNode` parents while retaining the recursive raster semantics.
+ */
+export interface IndexedRasterRecord {
+  readonly id: number;
+  readonly type: number;
+  readonly rect: Rect;
+  readonly style: ComputedStyle;
+  readonly text?: string;
+  readonly clip: Rect;
+  readonly opacity: number;
+}
+
+/**
+ * Candidates must be unique and sorted in the scene's global paint order.
+ * They may be restricted to records that can touch `RasterOptions.dirtyRows`.
+ * `paintOrder` is the complete semantic paint membership for the scene, not
+ * merely the candidate subset, so hit testing remains stable after a row-only
+ * raster pass.
+ */
+export interface IndexedRasterSnapshot {
+  readonly candidates: readonly IndexedRasterRecord[];
+  readonly paintOrder: readonly number[];
+}
+
 export function rasterize(
   root: HostNode,
   layout: LayoutResult,
@@ -46,21 +76,7 @@ export function rasterize(
   colorMode: PocketTuiColorMode = "ansi16",
   options: RasterOptions = {},
 ): RasterResult {
-  const incremental = options.dirtyRows !== undefined;
-  if (
-    incremental &&
-    (options.previousFrame === undefined ||
-      options.previousFrame.width !== width ||
-      options.previousFrame.height !== height)
-  ) {
-    throw new RangeError("incremental raster requires a previous frame with matching dimensions");
-  }
-  const selectedRows = incremental ? normalizeRows(options.dirtyRows!, height) : undefined;
-  const cells: RasterGrid = {
-    rows: new Map(),
-    selectedRows,
-    selectedRowSet: selectedRows === undefined ? undefined : new Set(selectedRows),
-  };
+  const { cells, incremental } = createRasterGrid(width, height, options);
   const paintOrder: number[] = [];
   const viewport: Rect = { x: 0, y: 0, width, height };
 
@@ -73,26 +89,21 @@ export function rasterize(
     const ownClip = intersect(parentClip, rect);
     if (ownClip === undefined) return;
 
-    let painted = false;
-    if (alpha(style.background) > 0) {
-      fillBackground(cells, width, height, ownClip, style.background, opacity, colorMode);
-      painted = true;
-    }
-    if (style.borderWidth >= 0.5 && alpha(style.borderColor) > 0) {
-      paintBorder(cells, width, height, rect, ownClip, style.borderColor, opacity, colorMode);
-      painted = true;
-    }
-
-    if (node.type === NODE.text) {
-      const text = layout.flattenedText.get(node.id) ?? node.text;
-      if (text.length > 0) {
-        paintText(cells, width, height, rect, ownClip, text, style, opacity, colorMode);
-        painted = true;
-      }
-    } else if (node.type === NODE.image) {
-      paintText(cells, width, height, rect, ownClip, "▧", style, opacity, colorMode);
-      painted = true;
-    }
+    const painted = paintRecord(
+      cells,
+      width,
+      height,
+      {
+        id: node.id,
+        type: node.type,
+        rect,
+        style,
+        text: node.type === NODE.text ? (layout.flattenedText.get(node.id) ?? node.text) : undefined,
+        clip: ownClip,
+        opacity,
+      },
+      colorMode,
+    );
     if (painted) paintOrder.push(node.id);
 
     if (node.type !== NODE.view) return;
@@ -108,6 +119,93 @@ export function rasterize(
     frame: compactFrame(cells, width, height, incremental ? options.previousFrame : undefined),
     paintOrder,
   };
+}
+
+/**
+ * Rasterize a paint-index candidate snapshot without traversing the retained
+ * `HostNode` scene. The full `rasterize` function remains the authoritative
+ * scene oracle used to build and verify indexed snapshots.
+ */
+export function rasterizeIndexed(
+  snapshot: IndexedRasterSnapshot,
+  width: number,
+  height: number,
+  colorMode: PocketTuiColorMode = "ansi16",
+  options: RasterOptions = {},
+): RasterResult {
+  const { cells, incremental } = createRasterGrid(width, height, options);
+  for (const record of snapshot.candidates) {
+    paintRecord(cells, width, height, record, colorMode);
+  }
+  return {
+    frame: compactFrame(cells, width, height, incremental ? options.previousFrame : undefined),
+    paintOrder: snapshot.paintOrder,
+  };
+}
+
+function createRasterGrid(
+  width: number,
+  height: number,
+  options: RasterOptions,
+): { readonly cells: RasterGrid; readonly incremental: boolean } {
+  const incremental = options.dirtyRows !== undefined;
+  if (
+    incremental &&
+    (options.previousFrame === undefined ||
+      options.previousFrame.width !== width ||
+      options.previousFrame.height !== height)
+  ) {
+    throw new RangeError("incremental raster requires a previous frame with matching dimensions");
+  }
+  const selectedRows = incremental ? normalizeRows(options.dirtyRows!, height) : undefined;
+  return {
+    incremental,
+    cells: {
+      rows: new Map(),
+      selectedRows,
+      selectedRowSet: selectedRows === undefined ? undefined : new Set(selectedRows),
+    },
+  };
+}
+
+function paintRecord(
+  cells: RasterGrid,
+  width: number,
+  height: number,
+  record: IndexedRasterRecord,
+  colorMode: PocketTuiColorMode,
+): boolean {
+  const { rect, style } = record;
+  const clip = intersect(record.clip, { x: 0, y: 0, width, height });
+  const opacity = clamp01(record.opacity);
+  if (
+    style.display === ENUM.displayNone ||
+    opacity <= 0 ||
+    rect.width <= 0 ||
+    rect.height <= 0 ||
+    clip === undefined
+  ) {
+    return false;
+  }
+
+  let painted = false;
+  if (alpha(style.background) > 0) {
+    fillBackground(cells, width, height, clip, style.background, opacity, colorMode);
+    painted = true;
+  }
+  if (style.borderWidth >= 0.5 && alpha(style.borderColor) > 0) {
+    paintBorder(cells, width, height, rect, clip, style.borderColor, opacity, colorMode);
+    painted = true;
+  }
+  const text = record.text ?? "";
+  if (record.type === NODE.text && text.length > 0) {
+    paintText(cells, width, height, rect, clip, text, style, opacity, colorMode);
+    painted = true;
+  } else if (record.type === NODE.image) {
+    paintText(cells, width, height, rect, clip, "▧", style, opacity, colorMode);
+    painted = true;
+  }
+  return painted;
 }
 
 function fillBackground(
