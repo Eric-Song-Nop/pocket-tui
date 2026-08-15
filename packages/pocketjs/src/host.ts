@@ -16,7 +16,12 @@ import {
   type LayoutCache,
 } from "./layout.js";
 import type { ComputedStyle, HostNode, LayoutEntry, LayoutResult, Rect } from "./model.js";
-import { rasterize, type PocketTuiColorMode } from "./raster.js";
+import {
+  buildPaintIndex,
+  type PaintIndexTransaction,
+  type RetainedPaintIndex,
+} from "./paint-index.js";
+import { rasterize, rasterizeIndexed, type PocketTuiColorMode } from "./raster.js";
 import {
   COLOR_PROPS,
   ENUM,
@@ -132,6 +137,24 @@ export interface PocketTuiHostDiagnostics {
   readonly lastRepaintedRows: number;
   /** Total rows rasterized by successfully presented frames. */
   readonly repaintedRows: number;
+  /** Successful frames that rebuilt the retained paint index from the scene root. */
+  readonly fullPaintIndexFrames: number;
+  /** Successful frames that patched one or more retained paint-index subtrees. */
+  readonly incrementalPaintIndexFrames: number;
+  /** Successful frames whose existing paint index required no record changes. */
+  readonly reusedPaintIndexFrames: number;
+  /** Incremental index frames that rebuilt global membership/order after a semantic change. */
+  readonly paintOrderRebuildFrames: number;
+  /** Paint-index records rebuilt by the most recently presented frame. */
+  readonly lastPaintIndexNodes: number;
+  /** Total paint-index records rebuilt by successfully presented frames. */
+  readonly paintIndexNodes: number;
+  /** Paint-index subtree roots rebuilt by the most recently presented frame. */
+  readonly lastPaintIndexRoots: number;
+  /** Painted index candidates considered by the latest presented raster pass. */
+  readonly lastRasterCandidates: number;
+  /** Total painted index candidates considered by successfully presented raster passes. */
+  readonly rasterCandidates: number;
   readonly lastRunCount: number;
   readonly missingStyles: number;
   readonly unsupportedProperties: number;
@@ -185,6 +208,15 @@ interface MutableDiagnostics {
   incrementalRasterFrames: number;
   lastRepaintedRows: number;
   repaintedRows: number;
+  fullPaintIndexFrames: number;
+  incrementalPaintIndexFrames: number;
+  reusedPaintIndexFrames: number;
+  paintOrderRebuildFrames: number;
+  lastPaintIndexNodes: number;
+  paintIndexNodes: number;
+  lastPaintIndexRoots: number;
+  lastRasterCandidates: number;
+  rasterCandidates: number;
   lastRunCount: number;
   missingStyles: number;
   unsupportedProperties: number;
@@ -233,6 +265,15 @@ export class PocketTuiHost {
     incrementalRasterFrames: 0,
     lastRepaintedRows: 0,
     repaintedRows: 0,
+    fullPaintIndexFrames: 0,
+    incrementalPaintIndexFrames: 0,
+    reusedPaintIndexFrames: 0,
+    paintOrderRebuildFrames: 0,
+    lastPaintIndexNodes: 0,
+    paintIndexNodes: 0,
+    lastPaintIndexRoots: 0,
+    lastRasterCandidates: 0,
+    rasterCandidates: 0,
     lastRunCount: 0,
     missingStyles: 0,
     unsupportedProperties: 0,
@@ -250,6 +291,7 @@ export class PocketTuiHost {
   #dirty: "full" | "layout" | "paint" | undefined = "full";
   readonly #layoutDirtyNodes = new Set<HostNode>();
   readonly #paintDirtyNodes = new Set<HostNode>();
+  readonly #paintOrderDirtyNodes = new Set<HostNode>();
   #layoutRevision = 0;
   #mutationRevision = 0;
   #surfacePending = false;
@@ -259,6 +301,7 @@ export class PocketTuiHost {
   #closed = false;
   #lastLayout?: LayoutResult;
   #lastLayoutCache?: LayoutCache;
+  #lastPaintIndex?: RetainedPaintIndex;
   #lastPaintOrder: readonly number[] = [];
   #lastFrame: CanvasFrame;
 
@@ -498,6 +541,7 @@ export class PocketTuiHost {
     let measuredNodes = 0;
     let reusedLayoutNodes = 0;
     let relayoutRoots = 0;
+    let localizedRoots: readonly HostNode[] = [];
     if (force || pending === "full" || previousLayout === undefined) {
       renderKind = "full";
       const pass = layoutTreeCached(
@@ -520,6 +564,7 @@ export class PocketTuiHost {
         dirtyRows = localized.dirtyRows;
         layoutNodes = localized.layoutNodes;
         measuredNodes = localized.measuredNodes;
+        localizedRoots = localized.roots;
         reusedLayoutNodes =
           localized.roots.length === 0
             ? 0
@@ -566,24 +611,112 @@ export class PocketTuiHost {
       layoutCache = this.#lastLayoutCache;
       dirtyRows = this.#collectDirtyRows(previousLayout, layout);
     }
-    const raster = rasterize(
-      this.#root,
-      layout,
-      this.#viewport.columns,
-      this.#viewport.rows,
-      this.#colorMode,
-      renderKind === "full"
-        ? undefined
-        : {
-            previousFrame: this.#lastFrame,
-            dirtyRows,
-          },
-    );
+    let paintIndexKind: "full" | "incremental" | "reuse";
+    let paintIndex: RetainedPaintIndex | PaintIndexTransaction;
+    let paintIndexTransaction: PaintIndexTransaction | undefined;
+    let paintIndexNodes = 0;
+    let paintIndexRoots = 0;
+    const retainedPaintIndex = this.#lastPaintIndex;
+    if (
+      renderKind === "full" ||
+      retainedPaintIndex === undefined ||
+      retainedPaintIndex.width !== this.#viewport.columns ||
+      retainedPaintIndex.height !== this.#viewport.rows
+    ) {
+      paintIndexKind = "full";
+      paintIndex = buildPaintIndex(
+        this.#root,
+        layout,
+        this.#viewport.columns,
+        this.#viewport.rows,
+        (node) => this.#computedStyle(node),
+      );
+      paintIndexNodes = paintIndex.nodeCount;
+      paintIndexRoots = 1;
+    } else {
+      const roots = this.#paintIndexPatchRoots(
+        renderKind,
+        previousLayout,
+        layout,
+        localizedRoots,
+      );
+      if (roots === undefined) {
+        paintIndexKind = "full";
+        paintIndex = buildPaintIndex(
+          this.#root,
+          layout,
+          this.#viewport.columns,
+          this.#viewport.rows,
+          (node) => this.#computedStyle(node),
+        );
+        paintIndexNodes = paintIndex.nodeCount;
+        paintIndexRoots = 1;
+      } else if (roots.length === 0) {
+        paintIndexKind = "reuse";
+        paintIndex = retainedPaintIndex;
+      } else {
+        try {
+          paintIndexTransaction = retainedPaintIndex.prepareSubtreePatch(
+            roots,
+            layout,
+            (node) => this.#computedStyle(node),
+          );
+          paintIndexKind = "incremental";
+          paintIndex = paintIndexTransaction;
+          paintIndexNodes = paintIndexTransaction.visitedNodes;
+          paintIndexRoots = paintIndexTransaction.roots;
+        } catch {
+          // A missing structural parent/context means this frame cannot prove
+          // a local replacement. Rebuild the index while keeping row raster
+          // incremental; the full scene raster remains the force oracle.
+          paintIndexKind = "full";
+          paintIndex = buildPaintIndex(
+            this.#root,
+            layout,
+            this.#viewport.columns,
+            this.#viewport.rows,
+            (node) => this.#computedStyle(node),
+          );
+          paintIndexNodes = paintIndex.nodeCount;
+          paintIndexRoots = 1;
+        }
+      }
+    }
+
+    let raster: ReturnType<typeof rasterize>;
+    let rasterCandidates: number;
+    if (renderKind === "full") {
+      raster = rasterize(
+        this.#root,
+        layout,
+        this.#viewport.columns,
+        this.#viewport.rows,
+        this.#colorMode,
+      );
+      if (!sameNumberArray(raster.paintOrder, paintIndex.paintOrder)) {
+        throw new Error("PocketTUI: retained paint index diverged from the full scene oracle");
+      }
+      rasterCandidates = raster.paintOrder.length;
+    } else {
+      if (dirtyRows === undefined) {
+        throw new Error("PocketTUI: incremental raster is missing its dirty-row set");
+      }
+      const snapshot = paintIndex.rasterSnapshot(dirtyRows);
+      rasterCandidates = snapshot.candidates.length;
+      raster = rasterizeIndexed(
+        snapshot,
+        this.#viewport.columns,
+        this.#viewport.rows,
+        this.#colorMode,
+        { previousFrame: this.#lastFrame, dirtyRows },
+      );
+    }
     const mutationRevision = this.#mutationRevision;
     const notifySurfaceWork = this.#setSurfacePending();
     try {
       this.#surface.present(raster.frame, renderKind === "full" ? undefined : dirtyRows);
     } catch (error) {
+      paintIndexTransaction?.discard();
       // A failed forced render from a clean scene still needs a render retry;
       // ordinary dirty renders already retain their more precise state.
       const promotedRenderRetry = this.#dirty === undefined;
@@ -604,13 +737,19 @@ export class PocketTuiHost {
             textRevisions: commitMap(layoutCache.textRevisions),
             subtreeEntryCounts: commitMap(layoutCache.subtreeEntryCounts),
           };
-    this.#lastPaintOrder = raster.paintOrder;
+    const committedPaintIndex =
+      paintIndexTransaction === undefined
+        ? (paintIndex as RetainedPaintIndex)
+        : paintIndexTransaction.commit();
+    this.#lastPaintIndex = committedPaintIndex;
+    this.#lastPaintOrder = committedPaintIndex.paintOrder;
     this.#lastFrame = raster.frame;
     const retainedRenderWork = mutationRevision !== this.#mutationRevision;
     if (!retainedRenderWork) {
       this.#dirty = undefined;
       this.#layoutDirtyNodes.clear();
       this.#paintDirtyNodes.clear();
+      this.#paintOrderDirtyNodes.clear();
     }
     this.#stats.renderedFrames += 1;
     if (renderKind === "full") {
@@ -639,6 +778,17 @@ export class PocketTuiHost {
     const repaintedRows = renderKind === "full" ? raster.frame.height : (dirtyRows?.size ?? 0);
     this.#stats.lastRepaintedRows = repaintedRows;
     this.#stats.repaintedRows += repaintedRows;
+    if (paintIndexKind === "full") this.#stats.fullPaintIndexFrames += 1;
+    else if (paintIndexKind === "incremental") this.#stats.incrementalPaintIndexFrames += 1;
+    else this.#stats.reusedPaintIndexFrames += 1;
+    if (paintIndexTransaction?.orderRebuilt === true) {
+      this.#stats.paintOrderRebuildFrames += 1;
+    }
+    this.#stats.lastPaintIndexNodes = paintIndexNodes;
+    this.#stats.paintIndexNodes += paintIndexNodes;
+    this.#stats.lastPaintIndexRoots = paintIndexRoots;
+    this.#stats.lastRasterCandidates = rasterCandidates;
+    this.#stats.rasterCandidates += rasterCandidates;
     this.#stats.lastRunCount = raster.frame.runs.length;
     if (notifySurfaceWork || retainedRenderWork) this.#notifyWorkNeeded();
     return raster.frame;
@@ -807,7 +957,7 @@ export class PocketTuiHost {
     node.inline.set(property, normalized);
     if (!SUPPORTED_PROPS.has(property)) this.#stats.unsupportedProperties += 1;
     if (PAINT_ONLY_PROPERTIES.has(property)) {
-      this.#markPaintMutation(node);
+      this.#markPaintMutation(node, property === PROP.zIndex);
     } else if (LAYOUT_PROPERTIES.has(property)) {
       this.#markLayoutMutation(node);
     } else {
@@ -903,6 +1053,7 @@ export class PocketTuiHost {
   #hitTest(x: number, y: number): number {
     this.#assertOpen();
     if (!Number.isFinite(x) || !Number.isFinite(y)) return 0;
+    if (this.#lastPaintIndex !== undefined) return this.#lastPaintIndex.hitTest(x, y);
     for (let index = this.#lastPaintOrder.length - 1; index >= 0; index -= 1) {
       const id = this.#lastPaintOrder[index];
       if (id === undefined) continue;
@@ -1101,6 +1252,71 @@ export class PocketTuiHost {
     };
   }
 
+  /**
+   * Derive exact structural roots whose retained paint records may differ.
+   * Layout transaction writes are filtered by raster-visible semantics so a
+   * cache-aware root pass does not accidentally promote every visited Flex
+   * ancestor into a full index rebuild.
+   */
+  #paintIndexPatchRoots(
+    renderKind: "full" | "localized" | "cached" | "reuse",
+    previous: LayoutResult | undefined,
+    current: LayoutResult,
+    localizedRoots: readonly HostNode[],
+  ): readonly HostNode[] | undefined {
+    if (renderKind === "full" || previous === undefined) return undefined;
+    const candidates = new Set<HostNode>();
+    if (renderKind === "localized") {
+      for (const root of localizedRoots) candidates.add(root);
+    } else if (renderKind === "cached") {
+      const changedIds = new Set<number>();
+      const preciseEntries = collectChangedMapKeys(current.entries, changedIds);
+      const preciseText = collectChangedMapKeys(current.flattenedText, changedIds);
+      if (!preciseEntries || !preciseText) return undefined;
+      for (const id of changedIds) {
+        const before = previous.entries.get(id);
+        const after = current.entries.get(id);
+        if (
+          samePaintIndexSemantics(
+            before,
+            after,
+            previous.flattenedText.get(id),
+            current.flattenedText.get(id),
+          )
+        ) {
+          continue;
+        }
+        const node = after?.node ?? before?.node;
+        if (node !== undefined && isAncestor(this.#root, node)) candidates.add(node);
+      }
+    }
+
+    for (const node of this.#paintDirtyNodes) {
+      if (isAncestor(this.#root, node)) candidates.add(node);
+    }
+    // A node's own z-index controls its position in the parent's ordered child
+    // list, so rebuild the parent subtree. Other paint properties can remain
+    // rooted at the changed node itself.
+    for (const node of this.#paintOrderDirtyNodes) {
+      if (!isAncestor(this.#root, node)) continue;
+      const parent = node.parent;
+      if (parent === null) return undefined;
+      candidates.add(parent);
+    }
+
+    const connected = [...candidates].filter((node) => isAncestor(this.#root, node));
+    if (connected.includes(this.#root)) return undefined;
+    const candidateIds = new Set(connected.map((node) => node.id));
+    return connected.filter((candidate) => {
+      let ancestor = candidate.parent;
+      while (ancestor !== null) {
+        if (candidateIds.has(ancestor.id)) return false;
+        ancestor = ancestor.parent;
+      }
+      return true;
+    });
+  }
+
   #collectLayoutDirtyRows(
     previous: LayoutResult,
     current: LayoutResult,
@@ -1202,6 +1418,7 @@ export class PocketTuiHost {
     this.#dirty = "full";
     this.#layoutDirtyNodes.clear();
     this.#paintDirtyNodes.clear();
+    this.#paintOrderDirtyNodes.clear();
     this.#mutationRevision += 1;
     this.#stats.mutations += 1;
     if (wasClean) this.#notifyWorkNeeded();
@@ -1224,11 +1441,12 @@ export class PocketTuiHost {
     if (wasClean) this.#notifyWorkNeeded();
   }
 
-  #markPaintMutation(node: HostNode): void {
+  #markPaintMutation(node: HostNode, affectsOrder = false): void {
     const wasClean = this.#dirty === undefined;
     if (this.#dirty !== "full") {
       if (this.#dirty === undefined) this.#dirty = "paint";
       this.#paintDirtyNodes.add(node);
+      if (affectsOrder) this.#paintOrderDirtyNodes.add(node);
     }
     this.#mutationRevision += 1;
     this.#stats.mutations += 1;
@@ -1339,6 +1557,40 @@ function sameRect(left: Rect, right: Rect): boolean {
     left.width === right.width &&
     left.height === right.height
   );
+}
+
+function samePaintIndexSemantics(
+  before: LayoutEntry | undefined,
+  after: LayoutEntry | undefined,
+  beforeText: string | undefined,
+  afterText: string | undefined,
+): boolean {
+  if (before === undefined || after === undefined) return before === after;
+  return (
+    sameRect(before.rect, after.rect) &&
+    samePaintStyle(before.style, after.style) &&
+    beforeText === afterText
+  );
+}
+
+function samePaintStyle(left: ComputedStyle, right: ComputedStyle): boolean {
+  return (
+    left.display === right.display &&
+    left.overflow === right.overflow &&
+    left.zIndex === right.zIndex &&
+    left.background === right.background &&
+    left.opacity === right.opacity &&
+    left.borderColor === right.borderColor &&
+    left.borderWidth === right.borderWidth &&
+    left.textColor === right.textColor &&
+    left.textAlign === right.textAlign &&
+    left.lineHeight === right.lineHeight &&
+    left.tracking === right.tracking
+  );
+}
+
+function sameNumberArray(left: readonly number[], right: readonly number[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function validateViewport(size: TuiViewportSize): TuiViewportSize {
