@@ -10,7 +10,7 @@ import type {
 } from "@pocket-tui/core";
 
 import { layoutTree } from "./layout.js";
-import type { ComputedStyle, HostNode, LayoutResult, Rect } from "./model.js";
+import type { ComputedStyle, HostNode, LayoutEntry, LayoutResult, Rect } from "./model.js";
 import { rasterize, type PocketTuiColorMode } from "./raster.js";
 import {
   COLOR_PROPS,
@@ -30,6 +30,18 @@ import { parseStyleTable, type HostStyleRecord, type PropertyMap } from "./style
 import { createCoreSurface, type PocketTuiSurface } from "./surface.js";
 import { lineWidth } from "./unicode.js";
 
+const PAINT_ONLY_PROPERTIES = new Set<number>([
+  PROP.overflow,
+  PROP.zIndex,
+  PROP.bgColor,
+  PROP.opacity,
+  PROP.borderColor,
+  PROP.borderWidth,
+  PROP.textColor,
+  PROP.textAlign,
+  PROP.tracking,
+]);
+
 export interface PocketTuiHostOptions {
   /** An injectable surface keeps HostOps contract tests independent of a TTY. */
   surface?: PocketTuiSurface;
@@ -47,6 +59,18 @@ export interface PocketTuiHostDiagnostics {
   readonly mutations: number;
   readonly renderedFrames: number;
   readonly skippedFrames: number;
+  /** Successful frames that recomputed cell geometry. */
+  readonly layoutPasses: number;
+  /** Successful paint-only frames that reused the previous geometry. */
+  readonly reusedLayoutFrames: number;
+  /** Successful frames rasterized across the complete viewport. */
+  readonly fullRasterFrames: number;
+  /** Successful frames rasterized only across affected rows. */
+  readonly incrementalRasterFrames: number;
+  /** Rows rasterized by the most recently presented frame. */
+  readonly lastRepaintedRows: number;
+  /** Total rows rasterized by successfully presented frames. */
+  readonly repaintedRows: number;
   readonly lastRunCount: number;
   readonly missingStyles: number;
   readonly unsupportedProperties: number;
@@ -84,6 +108,12 @@ interface MutableDiagnostics {
   mutations: number;
   renderedFrames: number;
   skippedFrames: number;
+  layoutPasses: number;
+  reusedLayoutFrames: number;
+  fullRasterFrames: number;
+  incrementalRasterFrames: number;
+  lastRepaintedRows: number;
+  repaintedRows: number;
   lastRunCount: number;
   missingStyles: number;
   unsupportedProperties: number;
@@ -107,6 +137,12 @@ export class PocketTuiHost {
     mutations: 0,
     renderedFrames: 0,
     skippedFrames: 0,
+    layoutPasses: 0,
+    reusedLayoutFrames: 0,
+    fullRasterFrames: 0,
+    incrementalRasterFrames: 0,
+    lastRepaintedRows: 0,
+    repaintedRows: 0,
     lastRunCount: 0,
     missingStyles: 0,
     unsupportedProperties: 0,
@@ -121,9 +157,13 @@ export class PocketTuiHost {
   #focused = 0;
   #nextAnimation = 1;
   #viewport: TuiViewportSize;
-  #dirty = true;
+  #dirty: "full" | "paint" | undefined = "full";
+  readonly #paintDirtyNodes = new Set<HostNode>();
+  #mutationRevision = 0;
   #surfacePending = false;
   #surfaceRevision = 0;
+  #rendering = false;
+  #renderNotificationPending = false;
   #closed = false;
   #lastLayout?: LayoutResult;
   #lastPaintOrder: readonly number[] = [];
@@ -176,9 +216,9 @@ export class PocketTuiHost {
     return this.#lastFrame;
   }
 
-  /** Whether retained scene mutations still need layout and raster work. */
+  /** Whether retained scene mutations still need layout and/or raster work. */
   get renderPending(): boolean {
-    return this.#dirty;
+    return this.#dirty !== undefined;
   }
 
   /** Whether commands submitted to the surface still need an explicit flush. */
@@ -202,7 +242,13 @@ export class PocketTuiHost {
     const registration = (): void => listener();
     this.#workListeners.add(registration);
     try {
-      if (this.#dirty || this.#surfacePending) registration();
+      if (this.#dirty !== undefined || this.#surfacePending) {
+        if (this.#rendering) {
+          this.#renderNotificationPending = true;
+        } else {
+          registration();
+        }
+      }
     } catch (error) {
       this.#workListeners.delete(registration);
       throw error;
@@ -304,37 +350,116 @@ export class PocketTuiHost {
 
   render(force = false): CanvasFrame {
     this.#assertOpen();
-    if (!this.#dirty && !force) {
+    if (this.#rendering) throw new Error("PocketTUI: render is already in progress");
+    this.#rendering = true;
+    let frame: CanvasFrame | undefined;
+    let renderFailed = false;
+    let renderFailure: unknown;
+    try {
+      frame = this.#renderFrame(force);
+    } catch (error) {
+      renderFailed = true;
+      renderFailure = error;
+    } finally {
+      this.#rendering = false;
+    }
+    const notify = this.#renderNotificationPending;
+    this.#renderNotificationPending = false;
+    let notificationFailed = false;
+    let notificationFailure: unknown;
+    if (notify) {
+      try {
+        this.#notifyWorkNeeded();
+      } catch (error) {
+        notificationFailed = true;
+        notificationFailure = error;
+      }
+    }
+    if (renderFailed) {
+      if (notificationFailed) {
+        throw new AggregateError(
+          [renderFailure, notificationFailure],
+          "PocketTUI: render failed and a work listener also failed",
+          { cause: renderFailure },
+        );
+      }
+      throw renderFailure;
+    }
+    if (notificationFailed) throw notificationFailure;
+    if (frame === undefined) throw new Error("PocketTUI: render produced no frame");
+    return frame;
+  }
+
+  #renderFrame(force: boolean): CanvasFrame {
+    const pending = this.#dirty;
+    if (pending === undefined && !force) {
       this.#stats.skippedFrames += 1;
       return this.#lastFrame;
     }
-    const layout = layoutTree(
-      this.#root,
-      this.#viewport.columns,
-      this.#viewport.rows,
-      (node) => this.#computedStyle(node),
-    );
+    const previousLayout = this.#lastLayout;
+    const full = force || pending !== "paint" || previousLayout === undefined;
+    let layout: LayoutResult;
+    let dirtyRows: Set<number> | undefined;
+    if (full) {
+      layout = layoutTree(
+        this.#root,
+        this.#viewport.columns,
+        this.#viewport.rows,
+        (node) => this.#computedStyle(node),
+      );
+    } else {
+      // `full` includes the missing-cache case, so the paint path always has
+      // committed geometry and text to reuse.
+      if (previousLayout === undefined) throw new Error("PocketTUI: missing retained layout");
+      layout = this.#refreshLayoutStyles(previousLayout);
+      dirtyRows = this.#collectDirtyRows(previousLayout);
+    }
     const raster = rasterize(
       this.#root,
       layout,
       this.#viewport.columns,
       this.#viewport.rows,
       this.#colorMode,
+      full
+        ? undefined
+        : {
+            previousFrame: this.#lastFrame,
+            dirtyRows,
+          },
     );
+    const mutationRevision = this.#mutationRevision;
     const notifySurfaceWork = this.#setSurfacePending();
     try {
       this.#surface.present(raster.frame);
     } catch (error) {
-      if (notifySurfaceWork) this.#notifyWorkNeeded();
+      // A failed forced render from a clean scene still needs a render retry;
+      // ordinary dirty renders already retain their more precise state.
+      const promotedRenderRetry = this.#dirty === undefined;
+      if (promotedRenderRetry) this.#dirty = "full";
+      if (notifySurfaceWork || promotedRenderRetry) this.#notifyWorkNeeded();
       throw error;
     }
     this.#lastLayout = layout;
     this.#lastPaintOrder = raster.paintOrder;
     this.#lastFrame = raster.frame;
-    this.#dirty = false;
+    const retainedRenderWork = mutationRevision !== this.#mutationRevision;
+    if (!retainedRenderWork) {
+      this.#dirty = undefined;
+      this.#paintDirtyNodes.clear();
+    }
     this.#stats.renderedFrames += 1;
+    if (full) {
+      this.#stats.layoutPasses += 1;
+      this.#stats.fullRasterFrames += 1;
+    } else {
+      this.#stats.reusedLayoutFrames += 1;
+      this.#stats.incrementalRasterFrames += 1;
+    }
+    const repaintedRows = full ? raster.frame.height : (dirtyRows?.size ?? 0);
+    this.#stats.lastRepaintedRows = repaintedRows;
+    this.#stats.repaintedRows += repaintedRows;
     this.#stats.lastRunCount = raster.frame.runs.length;
-    if (notifySurfaceWork) this.#notifyWorkNeeded();
+    if (notifySurfaceWork || retainedRenderWork) this.#notifyWorkNeeded();
     return raster.frame;
   }
 
@@ -500,7 +625,11 @@ export class PocketTuiHost {
     const normalized = COLOR_PROPS.has(property) ? value >>> 0 : value;
     node.inline.set(property, normalized);
     if (!SUPPORTED_PROPS.has(property)) this.#stats.unsupportedProperties += 1;
-    this.#markMutation();
+    if (PAINT_ONLY_PROPERTIES.has(property)) {
+      this.#markPaintMutation(node);
+    } else {
+      this.#markMutation();
+    }
   }
 
   #setText(id: number, value: string): void {
@@ -674,6 +803,36 @@ export class PocketTuiHost {
     };
   }
 
+  #refreshLayoutStyles(previous: LayoutResult): LayoutResult {
+    const entries = new Map<number, LayoutEntry>();
+    for (const [id, entry] of previous.entries) {
+      entries.set(id, {
+        node: entry.node,
+        style: this.#computedStyle(entry.node),
+        rect: entry.rect,
+      });
+    }
+    return { entries, flattenedText: previous.flattenedText };
+  }
+
+  #collectDirtyRows(layout: LayoutResult): Set<number> {
+    const rows = new Set<number>();
+    const visited = new Set<number>();
+    const collect = (node: HostNode): void => {
+      if (visited.has(node.id)) return;
+      visited.add(node.id);
+      const rect = layout.entries.get(node.id)?.rect;
+      if (rect !== undefined) {
+        const start = Math.max(0, rect.y);
+        const end = Math.min(this.#viewport.rows, rect.y + rect.height);
+        for (let row = start; row < end; row += 1) rows.add(row);
+      }
+      for (const child of node.children) collect(child);
+    };
+    for (const node of this.#paintDirtyNodes) collect(node);
+    return rows;
+  }
+
   #node(id: number): HostNode {
     if (!Number.isInteger(id) || id <= 0 || id > 0x7fff_ffff) {
       throw new RangeError(`PocketTUI: invalid PocketJS node id ${id}`);
@@ -710,10 +869,23 @@ export class PocketTuiHost {
   }
 
   #markMutation(): void {
-    const wasDirty = this.#dirty;
-    this.#dirty = true;
+    const wasClean = this.#dirty === undefined;
+    this.#dirty = "full";
+    this.#paintDirtyNodes.clear();
+    this.#mutationRevision += 1;
     this.#stats.mutations += 1;
-    if (!wasDirty) this.#notifyWorkNeeded();
+    if (wasClean) this.#notifyWorkNeeded();
+  }
+
+  #markPaintMutation(node: HostNode): void {
+    const wasClean = this.#dirty === undefined;
+    if (this.#dirty !== "full") {
+      this.#dirty = "paint";
+      this.#paintDirtyNodes.add(node);
+    }
+    this.#mutationRevision += 1;
+    this.#stats.mutations += 1;
+    if (wasClean) this.#notifyWorkNeeded();
   }
 
   #markSurfaceMutation(): void {
@@ -728,6 +900,10 @@ export class PocketTuiHost {
   }
 
   #notifyWorkNeeded(): void {
+    if (this.#rendering) {
+      this.#renderNotificationPending = true;
+      return;
+    }
     for (const listener of [...this.#workListeners]) listener();
   }
 

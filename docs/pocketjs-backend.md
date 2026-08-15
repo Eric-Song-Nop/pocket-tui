@@ -43,11 +43,15 @@ backend stores those mutations in a generational JS shadow tree and skips
 rasterization when it is clean.
 
 The reference backend is not yet the final native incremental renderer
-described in [the architecture document](architecture.md). When dirty, it lays
-out the active shadow tree and rasterizes the bounded viewport in JavaScript,
-then submits a complete semantic `CanvasFrame`. The Rust renderer still compares
-persistent rows and emits only actual terminal damage. There are no sparse
-Canvas patch opcodes yet.
+described in [the architecture document](architecture.md). It now distinguishes
+paint-only dirtiness from mutations that can change geometry. Paint-only frames
+reuse cached rectangles and flattened text, refresh computed styles, and
+reraster only the union of affected subtree rows. Geometry, text, tree,
+style-reference/table, focus, and active-state mutations retain full JavaScript
+layout and bounded viewport rasterization as the oracle. Both paths submit a
+complete semantic `CanvasFrame`; the Rust renderer compares persistent rows and
+emits only actual terminal damage. There are no sparse Canvas patch opcodes or
+local Flex reflow yet.
 
 ## Current retained model
 
@@ -193,8 +197,10 @@ Pixel-oriented PocketJS operations have bounded terminal fallbacks:
 | Known unsupported style | Stores but does not paint the property | `unsupportedProperties` |
 
 `session.diagnostics` also reports live nodes, HostOps mutations, rendered and
-skipped frames, the latest compact run count, missing style references,
-`framePolicy`, `steppedFrames`, `idleWaits`, and `wakeSignals`.
+skipped frames, layout passes and reused-layout frames, full and incremental
+raster frames, last/total repainted rows, the latest compact run count, missing
+style references, `framePolicy`, `steppedFrames`, `idleWaits`, and
+`wakeSignals`.
 Signal Below exposes a small `HOST LINK` sample of these counters in its
 receiver rail so the retained backend is observable while playing.
 
