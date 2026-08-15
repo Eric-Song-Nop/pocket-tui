@@ -43,6 +43,54 @@ Use `session.step()` when an external loop or a deterministic test should drive
 one frame at a time. An injectable `PocketTuiSurface` keeps HostOps contract
 tests independent of a TTY.
 
+## Focus and terminal components
+
+The package exposes PocketJS's real retained focus manager rather than keeping
+a second terminal-only focus tree. `focusNode`, `getFocused`, focus scopes, and
+focus grids operate on the same mirror nodes that drive `HostOps.setFocus`,
+focus/active style variants, detach repair, and CIRCLE presses.
+
+`Button`, `Checkbox`, and `TextInput` are small headless components built on
+that path. They do not require JSX or a second renderer:
+
+```ts
+import {
+  Button,
+  TextInput,
+  createElement,
+  createSignal,
+  insertNode,
+} from "@pocket-tui/pocketjs";
+
+function App() {
+  const [query, setQuery] = createSignal("");
+  const root = createElement("view");
+  insertNode(root, TextInput({
+    value: query,
+    onValueChange: setQuery,
+    onSubmit: (value) => console.log(value),
+    placeholder: "Search",
+  }));
+  insertNode(root, Button({
+    label: () => `Open ${query()}`,
+    onPress: () => console.log(query()),
+  }));
+  return root;
+}
+```
+
+Text input consumes UTF-8 text, bracketed paste chunks, Enter, editing arrows,
+and grapheme-aware Backspace only while it is focused. It anchors the real
+terminal bar cursor to its laid-out text node. `onInput` still runs first and
+can consume an event before a component sees it. With the default mapper,
+Enter on a focused `Button` becomes Pocket CIRCLE so active/release state and
+`onPress` use the ordinary Pocket lifecycle; elsewhere Enter retains its
+existing START mapping. A custom `mapInput` remains a complete replacement.
+
+The component defaults cover only cell geometry. Supply an inline style or a
+loaded PocketJS class for visual design; this keeps class `focus:` and
+`active:` variants free to override paint properties.
+
 ## Retained rendering behavior
 
 HostOps creates and mutates stable `view`, `text`, and `image` records in a
@@ -81,8 +129,9 @@ tracking. Known unsupported pixel-oriented properties increment diagnostics.
   The default mapper preserves recognized characters from a batched terminal
   text event, so inputs such as `.q` do not silently lose the quit command.
 - The default map covers arrows/WASD/HJKL, Space/P, `.`, R/Enter,
-  Q/Escape/Ctrl-C, and Backspace. Supply `mapInput` to replace it or `onInput`
-  to inspect and consume events first.
+  Q/Escape/Ctrl-C, and Backspace. Focused components may consume text/editing
+  events or specialize Enter as described above. Supply `mapInput` to replace
+  button mapping or `onInput` to inspect and consume events first.
 
 The optional effect bus is a PocketTUI surface extension, not part of PocketJS
 HostOps. Configure `tui.effectBus`, then use `session.setEffectBus(frame)` and
@@ -111,8 +160,8 @@ compatibility bridge because that release does not export its reset helper.
 ## PocketJS runtime surface
 
 The package re-exports the narrow PocketJS API needed by a TUI application:
-`BTN`, lifecycle hooks, Solid renderer helpers, `createSignal`, `createMemo`,
-and their corresponding types. Import reactive primitives from
+`BTN`, lifecycle hooks, focus APIs, Solid renderer helpers, `createSignal`,
+`createMemo`, and their corresponding types. Import reactive primitives from
 `@pocket-tui/pocketjs`, not directly from `solid-js`. The facade explicitly
 selects Solid's interactive client runtime even under Bun's default `node`
 export condition and owns its client root for exactly the Pocket mount

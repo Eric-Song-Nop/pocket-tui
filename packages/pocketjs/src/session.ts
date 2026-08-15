@@ -13,6 +13,12 @@ import {
   type PocketTuiHostOptions,
   PocketTuiHost,
 } from "./host.js";
+import {
+  dispatchTextInteraction,
+  focusedInteractionMapping,
+  releaseInteractionCursor,
+  syncInteractionCursor,
+} from "./interaction.js";
 
 export const POCKET_BUTTON = BTN;
 
@@ -52,6 +58,7 @@ export class PocketTuiSession {
   readonly #fps: number;
   readonly #directionPulsePolicy: "latest" | "queue";
   readonly #mapInput: PocketInputMapper;
+  readonly #usesDefaultInputMap: boolean;
   readonly #onInput?: PocketInputHandler;
   readonly #releaseLease: () => void;
   readonly #buttonPulses: number[] = [];
@@ -75,6 +82,7 @@ export class PocketTuiSession {
       options.directionPulsePolicy ?? "latest",
     );
     this.#mapInput = options.mapInput ?? defaultPocketInputMap;
+    this.#usesDefaultInputMap = options.mapInput === undefined;
     this.#onInput = options.onInput;
     this.#releaseLease = releaseLease;
     this.closed = new Promise<void>((resolve) => {
@@ -122,7 +130,10 @@ export class PocketTuiSession {
     for (const event of events) {
       if (event.kind === "resize") this.host.resize(event.columns, event.rows);
       if (this.#onInput?.(event, this) === true) continue;
-      const mapping = this.#mapInput(event);
+      if (dispatchTextInteraction(event)) continue;
+      const mapping =
+        (this.#usesDefaultInputMap ? focusedInteractionMapping(event) : undefined) ??
+        this.#mapInput(event);
       if (mapping === undefined) continue;
       const mappedButtons = typeof mapping === "number" ? [mapping] : mapping;
       if (mappedButtons.length > MAX_QUEUED_BUTTON_PULSES) {
@@ -155,6 +166,7 @@ export class PocketTuiSession {
     }
     frameHandler(buttons, 0x8080);
     const frame = this.host.render();
+    syncInteractionCursor(this.host);
     await this.host.flush("terminal");
     if (this.#closeRequested) await this.close();
     return { events, buttons, frame };
@@ -205,6 +217,7 @@ export class PocketTuiSession {
     let failure: unknown;
     try {
       this.#disposePocket();
+      releaseInteractionCursor(this.host);
       this.host.render(true);
       await this.host.flush("terminal");
     } catch (error) {
@@ -239,6 +252,7 @@ export async function mountPocketTui(
     host = options.host ?? createPocketTuiHost(options);
     disposePocket = mountWithSimulationRate(code, { ...options.pocket, ops: host.ops }, fps);
     host.render();
+    syncInteractionCursor(host);
     await host.start();
     await host.flush("terminal");
     return new PocketTuiSession(host, disposePocket, { ...options, fps }, releaseLease);
