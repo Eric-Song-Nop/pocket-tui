@@ -23,6 +23,7 @@ export const enum PtxOpcode {
   SetCanvasFrame = 14,
   SetCursor = 15,
   SetEffectBus = 16,
+  SetCanvasRows = 17,
 }
 
 export type BoxDirection = "column" | "row";
@@ -64,6 +65,27 @@ export interface CanvasFrame {
   readonly runs: readonly CanvasRun[];
 }
 
+/** One run inside a row replacement; the containing row owns its coordinate. */
+export interface CanvasRowRun {
+  readonly column: number;
+  readonly text: string;
+  readonly style?: TuiStyle;
+}
+
+/** Complete replacement for one canvas-local row. An empty run list clears it. */
+export interface CanvasRowReplacement {
+  readonly row: number;
+  readonly runs: readonly CanvasRowRun[];
+}
+
+/** Sparse row replacement against an exact retained Canvas revision. */
+export interface CanvasRowsPatch {
+  readonly baseRevision: bigint;
+  readonly width: number;
+  readonly height: number;
+  readonly rows: readonly CanvasRowReplacement[];
+}
+
 export type CursorShape = "block" | "underline" | "bar";
 
 export interface CursorPacketOptions {
@@ -102,6 +124,7 @@ export type DecodedPtxOperation =
   | { opcode: PtxOpcode.CreateVirtualTranscript; handle: bigint; transcript: bigint }
   | { opcode: PtxOpcode.CreateCanvas; handle: bigint }
   | { opcode: PtxOpcode.SetCanvasFrame; handle: bigint; frame: CanvasFrame }
+  | { opcode: PtxOpcode.SetCanvasRows; handle: bigint; patch: CanvasRowsPatch }
   | { opcode: PtxOpcode.SetCursor; options: Required<CursorPacketOptions> }
   | { opcode: PtxOpcode.SetEffectBus; options: Required<EffectBusPacketOptions> };
 
@@ -119,6 +142,123 @@ const ZERO_EFFECT_CHANNELS = [
   [0, 0, 0],
   [0, 0, 0],
 ] as const satisfies readonly [EffectBusChannel, EffectBusChannel, EffectBusChannel];
+
+interface PreparedCanvasFrame {
+  readonly payloadBytes: number;
+  readonly runs: readonly { readonly run: CanvasRun; readonly text: Uint8Array }[];
+}
+
+interface PreparedCanvasRows {
+  readonly payloadBytes: number;
+  readonly rows: readonly {
+    readonly row: number;
+    readonly runs: readonly { readonly run: CanvasRowRun; readonly text: Uint8Array }[];
+  }[];
+}
+
+/** Exact aligned PTX record size, excluding the shared packet header. */
+export function canvasFrameRecordByteLength(frame: CanvasFrame): number {
+  return align8(PTX_OPERATION_HEADER_BYTES + prepareCanvasFrame(frame).payloadBytes);
+}
+
+/** Exact aligned PTX record size, excluding the shared packet header. */
+export function canvasRowsRecordByteLength(patch: CanvasRowsPatch): number {
+  return align8(PTX_OPERATION_HEADER_BYTES + prepareCanvasRows(patch).payloadBytes);
+}
+
+function prepareCanvasFrame(frame: CanvasFrame): PreparedCanvasFrame {
+  assertCanvasDimensions(frame.width, frame.height);
+  if (!Number.isInteger(frame.runs.length) || frame.runs.length > 0xffff_ffff) {
+    throw new RangeError("canvas run count exceeds u32");
+  }
+  const runs = frame.runs.map((run, index) => {
+    assertU16(run.row, `canvas run ${index} row`);
+    assertCanvasRun(run.column, run.text, run.style, frame.width, `canvas run ${index}`);
+    if (run.row >= frame.height) {
+      throw new RangeError(`canvas run ${index} starts outside the frame`);
+    }
+    return { run, text: encodeRunText(run.text, `canvas run ${index}`) };
+  });
+  const payloadBytes = runs.reduce((sum, value) => sum + 20 + value.text.byteLength, 16);
+  assertCanvasPayloadBytes(payloadBytes, "canvas frame");
+  return { payloadBytes, runs };
+}
+
+function prepareCanvasRows(patch: CanvasRowsPatch): PreparedCanvasRows {
+  assertU64(patch.baseRevision, "canvas base revision");
+  assertCanvasDimensions(patch.width, patch.height);
+  if (
+    !Number.isInteger(patch.rows.length) ||
+    patch.rows.length === 0 ||
+    patch.rows.length > 0xffff_ffff
+  ) {
+    throw new RangeError("canvas row replacement count must be between 1 and u32 max");
+  }
+  let previousRow = -1;
+  const rows = patch.rows.map((replacement, rowIndex) => {
+    assertU16(replacement.row, `canvas row replacement ${rowIndex} row`);
+    if (replacement.row >= patch.height) {
+      throw new RangeError(`canvas row replacement ${rowIndex} is outside the frame`);
+    }
+    if (replacement.row <= previousRow) {
+      throw new RangeError("canvas row replacements must be strictly increasing and unique");
+    }
+    previousRow = replacement.row;
+    if (!Number.isInteger(replacement.runs.length) || replacement.runs.length > 0xffff_ffff) {
+      throw new RangeError(`canvas row replacement ${rowIndex} run count exceeds u32`);
+    }
+    const runs = replacement.runs.map((run, runIndex) => {
+      const label = `canvas row replacement ${rowIndex} run ${runIndex}`;
+      assertCanvasRun(run.column, run.text, run.style, patch.width, label);
+      return { run, text: encodeRunText(run.text, label) };
+    });
+    return { row: replacement.row, runs };
+  });
+  const payloadBytes = rows.reduce(
+    (sum, row) => row.runs.reduce((rowSum, value) => rowSum + 16 + value.text.byteLength, sum + 8),
+    24,
+  );
+  assertCanvasPayloadBytes(payloadBytes, "canvas row patch");
+  return { payloadBytes, rows };
+}
+
+function assertCanvasDimensions(width: number, height: number): void {
+  assertU16(width, "canvas width");
+  assertU16(height, "canvas height");
+  if (width === 0 || height === 0) {
+    throw new RangeError("canvas dimensions must be non-zero");
+  }
+}
+
+function assertCanvasRun(
+  column: number,
+  text: string,
+  style: TuiStyle | undefined,
+  width: number,
+  label: string,
+): void {
+  assertU16(column, `${label} column`);
+  if (column >= width) throw new RangeError(`${label} starts outside the frame`);
+  if (text.length === 0) throw new RangeError(`${label} is empty`);
+  if (/\r|\n/u.test(text)) throw new RangeError(`${label} contains a line break`);
+  encodeAttributes(style);
+  encodeColor(style?.foreground);
+  encodeColor(style?.background);
+}
+
+function encodeRunText(text: string, label: string): Uint8Array {
+  const value = encoder.encode(text);
+  if (value.byteLength > 0xffff_ffff) {
+    throw new RangeError(`${label} text exceeds u32 length`);
+  }
+  return value;
+}
+
+function assertCanvasPayloadBytes(byteLength: number, label: string): void {
+  if (!Number.isSafeInteger(byteLength) || byteLength > PTX_MAX_PACKET_BYTES) {
+    throw new RangeError(`${label} exceeds the PTX packet limit`);
+  }
+}
 
 /**
  * Builds one self-contained PTX1 packet. Handles and strings are values, never
@@ -207,44 +347,16 @@ export class PtxPacketEncoder {
 
   setCanvasFrame(handle: bigint, frame: CanvasFrame): this {
     assertHandle(handle);
-    assertU16(frame.width, "canvas width");
-    assertU16(frame.height, "canvas height");
-    if (frame.width === 0 || frame.height === 0) {
-      throw new RangeError("canvas dimensions must be non-zero");
-    }
-    if (!Number.isInteger(frame.runs.length) || frame.runs.length > 0xffff_ffff) {
-      throw new RangeError("canvas run count exceeds u32");
-    }
+    const prepared = prepareCanvasFrame(frame);
 
-    const encodedRuns = frame.runs.map((run, index) => {
-      assertU16(run.row, `canvas run ${index} row`);
-      assertU16(run.column, `canvas run ${index} column`);
-      if (run.row >= frame.height || run.column >= frame.width) {
-        throw new RangeError(`canvas run ${index} starts outside the frame`);
-      }
-      if (run.text.length === 0) throw new RangeError(`canvas run ${index} is empty`);
-      if (/\r|\n/u.test(run.text)) {
-        throw new RangeError(`canvas run ${index} contains a line break`);
-      }
-      const text = encoder.encode(run.text);
-      if (text.byteLength > 0xffff_ffff) {
-        throw new RangeError(`canvas run ${index} text exceeds u32 length`);
-      }
-      return { run, text };
-    });
-    const byteLength = encodedRuns.reduce((sum, value) => sum + 20 + value.text.byteLength, 16);
-    if (!Number.isSafeInteger(byteLength) || byteLength > PTX_MAX_PACKET_BYTES) {
-      throw new RangeError("canvas frame exceeds the PTX packet limit");
-    }
-
-    const payload = new Uint8Array(byteLength);
+    const payload = new Uint8Array(prepared.payloadBytes);
     const view = dataView(payload);
     view.setBigUint64(0, handle, true);
     view.setUint16(8, frame.width, true);
     view.setUint16(10, frame.height, true);
-    view.setUint32(12, encodedRuns.length, true);
+    view.setUint32(12, prepared.runs.length, true);
     let offset = 16;
-    for (const { run, text } of encodedRuns) {
+    for (const { run, text } of prepared.runs) {
       view.setUint16(offset, run.row, true);
       view.setUint16(offset + 2, run.column, true);
       view.setUint16(offset + 4, encodeAttributes(run.style), true);
@@ -255,6 +367,34 @@ export class PtxPacketEncoder {
       offset += 20 + text.byteLength;
     }
     return this.#record(PtxOpcode.SetCanvasFrame, payload);
+  }
+
+  setCanvasRows(handle: bigint, patch: CanvasRowsPatch): this {
+    assertHandle(handle);
+    const prepared = prepareCanvasRows(patch);
+    const payload = new Uint8Array(prepared.payloadBytes);
+    const view = dataView(payload);
+    view.setBigUint64(0, handle, true);
+    view.setBigUint64(8, patch.baseRevision, true);
+    view.setUint16(16, patch.width, true);
+    view.setUint16(18, patch.height, true);
+    view.setUint32(20, prepared.rows.length, true);
+    let offset = 24;
+    for (const row of prepared.rows) {
+      view.setUint16(offset, row.row, true);
+      view.setUint32(offset + 4, row.runs.length, true);
+      offset += 8;
+      for (const { run, text } of row.runs) {
+        view.setUint16(offset, run.column, true);
+        view.setUint16(offset + 2, encodeAttributes(run.style), true);
+        view.setUint32(offset + 4, encodeColor(run.style?.foreground), true);
+        view.setUint32(offset + 8, encodeColor(run.style?.background), true);
+        view.setUint32(offset + 12, text.byteLength, true);
+        payload.set(text, offset + 16);
+        offset += 16 + text.byteLength;
+      }
+    }
+    return this.#record(PtxOpcode.SetCanvasRows, payload);
   }
 
   setCursor(options: CursorPacketOptions): this {
@@ -544,6 +684,78 @@ function decodeOperation(
       }
       return { opcode, handle: canvasHandle, frame: { width, height, runs } };
     }
+    case PtxOpcode.SetCanvasRows: {
+      ensurePayload(payloadLength, 24);
+      const canvasHandle = view.getBigUint64(payloadOffset, true);
+      const baseRevision = view.getBigUint64(payloadOffset + 8, true);
+      const width = view.getUint16(payloadOffset + 16, true);
+      const height = view.getUint16(payloadOffset + 18, true);
+      if (width === 0 || height === 0) {
+        throw new PtxDecodeError("canvas dimensions must be non-zero");
+      }
+      const rowCount = view.getUint32(payloadOffset + 20, true);
+      if (rowCount === 0 || rowCount > height) {
+        throw new PtxDecodeError("canvas row replacement count is zero or exceeds frame height");
+      }
+      const rows: CanvasRowReplacement[] = [];
+      const payloadEnd = payloadOffset + payloadLength;
+      let cursor = payloadOffset + 24;
+      let previousRow = -1;
+      for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+        if (cursor + 8 > payloadEnd) {
+          throw new PtxDecodeError("canvas row replacement header exceeds record bounds");
+        }
+        const row = view.getUint16(cursor, true);
+        if (packet[cursor + 2] !== 0 || packet[cursor + 3] !== 0) {
+          throw new PtxDecodeError("non-zero canvas row replacement padding");
+        }
+        if (row >= height) throw new PtxDecodeError("canvas row replacement is outside the frame");
+        if (row <= previousRow) {
+          throw new PtxDecodeError("canvas row replacements are not strictly increasing and unique");
+        }
+        previousRow = row;
+        const runCount = view.getUint32(cursor + 4, true);
+        cursor += 8;
+        if (runCount > Math.floor((payloadEnd - cursor) / 16)) {
+          throw new PtxDecodeError("impossible canvas row run count");
+        }
+        const runs: CanvasRowRun[] = [];
+        for (let runIndex = 0; runIndex < runCount; runIndex += 1) {
+          if (cursor + 16 > payloadEnd) {
+            throw new PtxDecodeError("canvas row run header exceeds record bounds");
+          }
+          const column = view.getUint16(cursor, true);
+          const attributes = view.getUint16(cursor + 2, true);
+          const foreground = decodeColor(view.getUint32(cursor + 4, true));
+          const background = decodeColor(view.getUint32(cursor + 8, true));
+          const textLength = view.getUint32(cursor + 12, true);
+          cursor += 16;
+          if (cursor + textLength > payloadEnd) {
+            throw new PtxDecodeError("canvas row run text exceeds record bounds");
+          }
+          const text = decoder.decode(packet.subarray(cursor, cursor + textLength));
+          cursor += textLength;
+          if (column >= width) throw new PtxDecodeError("canvas row run starts outside the frame");
+          if (text.length === 0 || /\r|\n/u.test(text)) {
+            throw new PtxDecodeError("canvas row run text is empty or multiline");
+          }
+          runs.push({
+            column,
+            text,
+            style: decodeStyle(attributes, foreground, background),
+          });
+        }
+        rows.push({ row, runs });
+      }
+      if (packet.subarray(cursor, payloadEnd).some((byte) => byte !== 0)) {
+        throw new PtxDecodeError("non-zero canvas row patch padding");
+      }
+      return {
+        opcode,
+        handle: canvasHandle,
+        patch: { baseRevision, width, height, rows },
+      };
+    }
     case PtxOpcode.SetCursor: {
       ensurePayload(payloadLength, 16);
       const visibleByte = packet[payloadOffset + 4];
@@ -620,6 +832,12 @@ function align8(value: number): number {
 function assertHandle(handle: bigint): void {
   if (handle <= 0n || handle > 0xffff_ffff_ffff_ffffn) {
     throw new RangeError("PTX handle must be a non-zero u64");
+  }
+}
+
+function assertU64(value: bigint, name: string): void {
+  if (typeof value !== "bigint" || value < 0n || value > 0xffff_ffff_ffff_ffffn) {
+    throw new RangeError(`${name} must be a u64`);
   }
 }
 

@@ -27,6 +27,7 @@ pub enum Opcode {
     SetCanvasFrame = 14,
     SetCursor = 15,
     SetEffectBus = 16,
+    SetCanvasRows = 17,
 }
 
 impl TryFrom<u16> for Opcode {
@@ -50,6 +51,7 @@ impl TryFrom<u16> for Opcode {
             14 => Ok(Self::SetCanvasFrame),
             15 => Ok(Self::SetCursor),
             16 => Ok(Self::SetEffectBus),
+            17 => Ok(Self::SetCanvasRows),
             _ => Err(DecodeError::new(format!("unknown required opcode {value}"))),
         }
     }
@@ -89,6 +91,12 @@ pub struct CanvasRun<'a> {
     pub foreground: ColorSpec,
     pub background: ColorSpec,
     pub text: &'a str,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct CanvasRow<'a> {
+    pub row: u16,
+    pub runs: Vec<CanvasRun<'a>>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -147,6 +155,13 @@ pub enum Operation<'a> {
         width: u16,
         height: u16,
         runs: Vec<CanvasRun<'a>>,
+    },
+    SetCanvasRows {
+        handle: u64,
+        base_revision: u64,
+        width: u16,
+        height: u16,
+        rows: Vec<CanvasRow<'a>>,
     },
     SetCursor {
         row: u16,
@@ -337,6 +352,7 @@ fn decode_operation(opcode: Opcode, payload: &[u8]) -> Result<Operation<'_>, Dec
             })
         }
         Opcode::SetCanvasFrame => decode_canvas_frame(payload),
+        Opcode::SetCanvasRows => decode_canvas_rows(payload),
         Opcode::SetCursor => {
             require_payload(payload, 16)?;
             let visible = match payload[4] {
@@ -459,6 +475,105 @@ fn decode_canvas_frame(payload: &[u8]) -> Result<Operation<'_>, DecodeError> {
         width,
         height,
         runs,
+    })
+}
+
+fn decode_canvas_rows(payload: &[u8]) -> Result<Operation<'_>, DecodeError> {
+    const HEADER_LEN: usize = 24;
+    const ROW_HEADER_LEN: usize = 8;
+    const RUN_HEADER_LEN: usize = 16;
+
+    require_payload(payload, HEADER_LEN)?;
+    let handle = read_u64(payload, 0)?;
+    let base_revision = read_u64(payload, 8)?;
+    let width = read_u16(payload, 16)?;
+    let height = read_u16(payload, 18)?;
+    if width == 0 || height == 0 {
+        return Err(DecodeError::new("canvas dimensions must be non-zero"));
+    }
+    let row_count = read_u32(payload, 20)? as usize;
+    if row_count == 0 || row_count > usize::from(height) {
+        return Err(DecodeError::new(
+            "canvas row replacement count is zero or exceeds frame height",
+        ));
+    }
+    if row_count > payload.len().saturating_sub(HEADER_LEN) / ROW_HEADER_LEN {
+        return Err(DecodeError::new("impossible canvas row count"));
+    }
+
+    let mut offset = HEADER_LEN;
+    let mut previous_row = None;
+    let mut rows = Vec::with_capacity(row_count);
+    for _ in 0..row_count {
+        let row_header_end = offset
+            .checked_add(ROW_HEADER_LEN)
+            .filter(|end| *end <= payload.len())
+            .ok_or_else(|| DecodeError::new("canvas row header exceeds record bounds"))?;
+        let row = read_u16(payload, offset)?;
+        if row >= height {
+            return Err(DecodeError::new("canvas patch row is outside the frame"));
+        }
+        if previous_row.is_some_and(|previous| row <= previous) {
+            return Err(DecodeError::new(
+                "canvas patch rows must be strictly increasing",
+            ));
+        }
+        if payload[offset + 2..offset + 4]
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Err(DecodeError::new("non-zero canvas row padding"));
+        }
+        let run_count = read_u32(payload, offset + 4)? as usize;
+        offset = row_header_end;
+        if run_count > payload.len().saturating_sub(offset) / RUN_HEADER_LEN {
+            return Err(DecodeError::new("impossible canvas row run count"));
+        }
+
+        let mut runs = Vec::with_capacity(run_count);
+        for _ in 0..run_count {
+            let run_header_end = offset
+                .checked_add(RUN_HEADER_LEN)
+                .filter(|end| *end <= payload.len())
+                .ok_or_else(|| DecodeError::new("canvas row run header exceeds record bounds"))?;
+            let text_len = read_u32(payload, offset + 12)? as usize;
+            let text_end = run_header_end
+                .checked_add(text_len)
+                .filter(|end| *end <= payload.len())
+                .ok_or_else(|| DecodeError::new("canvas row run text exceeds record bounds"))?;
+            let text = std::str::from_utf8(&payload[run_header_end..text_end])
+                .map_err(|_| DecodeError::new("canvas row run text is not valid UTF-8"))?;
+            let run = CanvasRun {
+                row,
+                column: read_u16(payload, offset)?,
+                attributes: read_u16(payload, offset + 2)?,
+                foreground: decode_color(read_u32(payload, offset + 4)?)?,
+                background: decode_color(read_u32(payload, offset + 8)?)?,
+                text,
+            };
+            if run.column >= width {
+                return Err(DecodeError::new("canvas row run starts outside the frame"));
+            }
+            if run.text.is_empty() || run.text.contains(['\r', '\n']) {
+                return Err(DecodeError::new(
+                    "canvas row run text is empty or multiline",
+                ));
+            }
+            runs.push(run);
+            offset = text_end;
+        }
+        rows.push(CanvasRow { row, runs });
+        previous_row = Some(row);
+    }
+    if payload[offset..].iter().any(|byte| *byte != 0) {
+        return Err(DecodeError::new("non-zero canvas row patch padding"));
+    }
+    Ok(Operation::SetCanvasRows {
+        handle,
+        base_revision,
+        width,
+        height,
+        rows,
     })
 }
 
@@ -606,5 +721,107 @@ mod tests {
                 .to_string(),
             "non-zero SetCursor padding"
         );
+    }
+
+    #[test]
+    fn canvas_rows_decode_replacements_and_an_empty_clear_row() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&9_u64.to_le_bytes());
+        payload.extend_from_slice(&4_u64.to_le_bytes());
+        payload.extend_from_slice(&6_u16.to_le_bytes());
+        payload.extend_from_slice(&3_u16.to_le_bytes());
+        payload.extend_from_slice(&2_u32.to_le_bytes());
+
+        payload.extend_from_slice(&0_u16.to_le_bytes());
+        payload.extend_from_slice(&0_u16.to_le_bytes());
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.extend_from_slice(&1_u16.to_le_bytes());
+        payload.extend_from_slice(&3_u16.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&0x0100_0002_u32.to_le_bytes());
+        payload.extend_from_slice(&3_u32.to_le_bytes());
+        payload.extend_from_slice("界".as_bytes());
+
+        payload.extend_from_slice(&2_u16.to_le_bytes());
+        payload.extend_from_slice(&0_u16.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        while payload.len() % 8 != 0 {
+            payload.push(0);
+        }
+
+        let packet = single_operation_packet(17, &payload);
+        assert_eq!(
+            decode(&packet).unwrap(),
+            Packet {
+                flags: 0,
+                sequence: 7,
+                operations: vec![Operation::SetCanvasRows {
+                    handle: 9,
+                    base_revision: 4,
+                    width: 6,
+                    height: 3,
+                    rows: vec![
+                        CanvasRow {
+                            row: 0,
+                            runs: vec![CanvasRun {
+                                row: 0,
+                                column: 1,
+                                attributes: 3,
+                                foreground: ColorSpec::Default,
+                                background: ColorSpec::Indexed(2),
+                                text: "界",
+                            }],
+                        },
+                        CanvasRow {
+                            row: 2,
+                            runs: Vec::new(),
+                        },
+                    ],
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn canvas_rows_require_a_non_empty_strictly_increasing_row_set() {
+        let mut empty = vec![0_u8; 24];
+        empty[16..18].copy_from_slice(&4_u16.to_le_bytes());
+        empty[18..20].copy_from_slice(&3_u16.to_le_bytes());
+        assert_eq!(
+            decode_operation(Opcode::SetCanvasRows, &empty)
+                .unwrap_err()
+                .to_string(),
+            "canvas row replacement count is zero or exceeds frame height"
+        );
+
+        let mut unordered = empty;
+        unordered[20..24].copy_from_slice(&2_u32.to_le_bytes());
+        for row in [1_u16, 1] {
+            unordered.extend_from_slice(&row.to_le_bytes());
+            unordered.extend_from_slice(&0_u16.to_le_bytes());
+            unordered.extend_from_slice(&0_u32.to_le_bytes());
+        }
+        assert_eq!(
+            decode_operation(Opcode::SetCanvasRows, &unordered)
+                .unwrap_err()
+                .to_string(),
+            "canvas patch rows must be strictly increasing"
+        );
+    }
+
+    fn single_operation_packet(opcode: u16, payload: &[u8]) -> Vec<u8> {
+        let packet_len = HEADER_LEN + OP_HEADER_LEN + payload.len();
+        let mut packet = Vec::with_capacity(packet_len);
+        packet.extend_from_slice(&MAGIC);
+        packet.extend_from_slice(&MAJOR_VERSION.to_le_bytes());
+        packet.extend_from_slice(&0_u16.to_le_bytes());
+        packet.extend_from_slice(&(packet_len as u32).to_le_bytes());
+        packet.extend_from_slice(&1_u32.to_le_bytes());
+        packet.extend_from_slice(&7_u64.to_le_bytes());
+        packet.extend_from_slice(&opcode.to_le_bytes());
+        packet.extend_from_slice(&0_u16.to_le_bytes());
+        packet.extend_from_slice(&((OP_HEADER_LEN + payload.len()) as u32).to_le_bytes());
+        packet.extend_from_slice(payload);
+        packet
     }
 }

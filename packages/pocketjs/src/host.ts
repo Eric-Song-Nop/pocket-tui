@@ -582,7 +582,7 @@ export class PocketTuiHost {
     const mutationRevision = this.#mutationRevision;
     const notifySurfaceWork = this.#setSurfacePending();
     try {
-      this.#surface.present(raster.frame);
+      this.#surface.present(raster.frame, renderKind === "full" ? undefined : dirtyRows);
     } catch (error) {
       // A failed forced render from a clean scene still needs a render retry;
       // ordinary dirty renders already retain their more precise state.

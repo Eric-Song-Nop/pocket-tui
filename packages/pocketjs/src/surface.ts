@@ -11,7 +11,8 @@ import {
 
 export interface PocketTuiSurface {
   viewportSize(): TuiViewportSize;
-  present(frame: CanvasFrame): void;
+  /** Dirty rows are an optional whole-row patch hint; custom surfaces may ignore it. */
+  present(frame: CanvasFrame, dirtyRows?: ReadonlySet<number>): void;
   setCursor(options: CursorPacketOptions): void;
   setEffectBus?(frame: EffectBusFrame): void;
   clearEffectBus?(): void;
@@ -37,8 +38,8 @@ export function createCoreSurface(options: CreateTuiOptions = {}): PocketTuiSurf
   app.mount(canvas);
   return {
     viewportSize: () => app.viewportSize(),
-    present: (frame) => {
-      canvas.present(frame);
+    present: (frame, dirtyRows) => {
+      canvas.present(frame, dirtyRows === undefined ? undefined : { dirtyRows });
     },
     setCursor: (cursor) => {
       app.setCursor(cursor);

@@ -1,4 +1,5 @@
 import {
+  NATIVE_PROTOCOL_FEATURE_CANVAS_ROWS,
   loadNativeBinding,
   type NativeBinding,
   type NativeInputEvent,
@@ -8,8 +9,12 @@ import {
 } from "./native.js";
 import {
   PtxPacketEncoder,
+  canvasFrameRecordByteLength,
+  canvasRowsRecordByteLength,
   type BoxPacketOptions,
   type CanvasFrame,
+  type CanvasRowRun,
+  type CanvasRowsPatch,
   type CursorPacketOptions,
   type EffectBusChannel,
   type EffectBusPacketOptions,
@@ -40,6 +45,32 @@ export interface EffectBusFrame {
   readonly channels?: readonly [EffectBusChannel, EffectBusChannel, EffectBusChannel];
 }
 
+export interface CanvasPresentOptions {
+  /** Canvas-local rows fully replaced by this frame. Omitted rows must be unchanged. */
+  readonly dirtyRows?: ReadonlySet<number> | readonly number[];
+}
+
+interface CanvasRevisionState {
+  confirmedRevision: bigint;
+  queuedRevision: bigint;
+  confirmedWidth: number;
+  confirmedHeight: number;
+  queuedWidth: number;
+  queuedHeight: number;
+  confirmedFrame: boolean;
+  queuedFrame: boolean;
+}
+
+interface CanvasFrameCommand {
+  readonly kind: "setCanvasFrame";
+  readonly handle: bigint;
+  readonly frame: CanvasFrame;
+  readonly patch?: CanvasRowsPatch;
+  readonly baseRevision: bigint;
+  readonly revision: bigint;
+  readonly state: CanvasRevisionState;
+}
+
 type Command =
   | { kind: "createBox"; handle: bigint; options: BoxPacketOptions }
   | { kind: "createText"; handle: bigint; text: string }
@@ -54,7 +85,7 @@ type Command =
   | { kind: "sealBlock"; block: bigint }
   | { kind: "createVirtualTranscript"; handle: bigint; transcript: bigint }
   | { kind: "createCanvas"; handle: bigint }
-  | { kind: "setCanvasFrame"; handle: bigint; frame: CanvasFrame }
+  | CanvasFrameCommand
   | { kind: "setCursor"; options: CursorPacketOptions }
   | { kind: "setEffectBus"; options: EffectBusPacketOptions };
 
@@ -160,14 +191,25 @@ export class VirtualTranscriptHandle extends SceneHandle {
 
 /** A retained, styled cell surface intended for games, charts, and custom widgets. */
 export class CanvasHandle extends SceneHandle {
+  readonly #revision: CanvasRevisionState = {
+    confirmedRevision: 0n,
+    queuedRevision: 0n,
+    confirmedWidth: 1,
+    confirmedHeight: 1,
+    queuedWidth: 1,
+    queuedHeight: 1,
+    confirmedFrame: false,
+    queuedFrame: false,
+  };
+
   /** @internal */
   constructor(app: TuiApp, id: bigint) {
     super(app, id);
   }
 
-  present(frame: CanvasFrame): this {
+  present(frame: CanvasFrame, options: CanvasPresentOptions = {}): this {
     this._assertLive();
-    this._owner()._setCanvasFrame(this.id, frame);
+    this._owner()._setCanvasFrame(this.id, frame, options, this.#revision);
     return this;
   }
 }
@@ -233,6 +275,7 @@ export class TuiApp {
   #sequence = 1n;
   #commands: Command[] = [];
   #native?: NativeTuiSession;
+  #protocolFeatures = 0;
   #root?: SceneHandle;
   #nextCommitToken = 1;
   #scheduledCommitToken?: number;
@@ -501,28 +544,51 @@ export class TuiApp {
   }
 
   /** @internal */
-  _setCanvasFrame(handle: bigint, frame: CanvasFrame): void {
+  _setCanvasFrame(
+    handle: bigint,
+    frame: CanvasFrame,
+    options: CanvasPresentOptions,
+    state: CanvasRevisionState,
+  ): void {
+    const dirtyRows = normalizeCanvasRows(options.dirtyRows, frame.height);
+    if (
+      dirtyRows?.length === 0 &&
+      state.queuedFrame &&
+      state.queuedWidth === frame.width &&
+      state.queuedHeight === frame.height
+    ) {
+      return;
+    }
+    const retained = cloneCanvasFrame(frame);
+    const fullRecordBytes = canvasFrameRecordByteLength(retained);
+    const baseRevision = state.queuedRevision;
+    const revision = nextCanvasRevision(baseRevision);
+    let patch: CanvasRowsPatch | undefined;
+    if (
+      dirtyRows !== undefined &&
+      dirtyRows.length > 0 &&
+      dirtyRows.length < retained.height &&
+      state.queuedFrame &&
+      state.queuedWidth === retained.width &&
+      state.queuedHeight === retained.height
+    ) {
+      const candidate = canvasRowsPatch(retained, dirtyRows, baseRevision);
+      if (canvasRowsRecordByteLength(candidate) < fullRecordBytes) patch = candidate;
+    }
+
     this.#enqueue({
       kind: "setCanvasFrame",
       handle,
-      frame: {
-        width: frame.width,
-        height: frame.height,
-        runs: frame.runs.map((run) => ({
-          ...run,
-          style:
-            run.style === undefined
-              ? undefined
-              : {
-                  ...run.style,
-                  foreground:
-                    run.style.foreground === undefined ? undefined : { ...run.style.foreground },
-                  background:
-                    run.style.background === undefined ? undefined : { ...run.style.background },
-                },
-        })),
-      },
+      frame: retained,
+      patch,
+      baseRevision,
+      revision,
+      state,
     });
+    state.queuedRevision = revision;
+    state.queuedWidth = retained.width;
+    state.queuedHeight = retained.height;
+    state.queuedFrame = true;
   }
 
   /** @internal */
@@ -562,11 +628,18 @@ export class TuiApp {
     if (this.#native === undefined) return;
     const commands = this.#commands;
     const encoder = new PtxPacketEncoder(this.#sequence);
-    for (const command of commands) encodeCommand(encoder, command);
+    for (const command of commands) encodeCommand(encoder, command, this.#protocolFeatures);
     const packet = encoder.finish();
     const accepted = BigInt(this.#native.submit(packet));
     if (accepted !== this.#sequence) {
       throw new Error(`Native PTX receipt mismatch: expected ${this.#sequence}, received ${accepted}`);
+    }
+    for (const command of commands) {
+      if (command.kind !== "setCanvasFrame") continue;
+      command.state.confirmedRevision = command.revision;
+      command.state.confirmedWidth = command.frame.width;
+      command.state.confirmedHeight = command.frame.height;
+      command.state.confirmedFrame = true;
     }
     this.#commands = [];
     this.#sequence += 1n;
@@ -575,7 +648,17 @@ export class TuiApp {
   #ensureNative(): NativeTuiSession {
     if (this.#native !== undefined) return this.#native;
     const binding = this.options.nativeBinding ?? loadNativeBinding(this.options.nativePath);
-    this.#native = new binding.NativeTui();
+    const protocolFeatures = binding.protocolFeatures?.() ?? 0;
+    if (
+      !Number.isInteger(protocolFeatures) ||
+      protocolFeatures < 0 ||
+      protocolFeatures > 0xffff_ffff
+    ) {
+      throw new TypeError("PocketTUI native protocol features must be a u32 bitset");
+    }
+    const native = new binding.NativeTui();
+    this.#protocolFeatures = protocolFeatures >>> 0;
+    this.#native = native;
     return this.#native;
   }
 
@@ -641,6 +724,70 @@ function environmentViewportSize(): NativeViewportSize {
   return { columns: dimension("COLUMNS", 80), rows: dimension("LINES", 24) };
 }
 
+function cloneCanvasFrame(frame: CanvasFrame): CanvasFrame {
+  return {
+    width: frame.width,
+    height: frame.height,
+    runs: frame.runs.map((run) => ({
+      row: run.row,
+      column: run.column,
+      text: run.text,
+      style:
+        run.style === undefined
+          ? undefined
+          : {
+              ...run.style,
+              foreground:
+                run.style.foreground === undefined ? undefined : { ...run.style.foreground },
+              background:
+                run.style.background === undefined ? undefined : { ...run.style.background },
+            },
+    })),
+  };
+}
+
+function normalizeCanvasRows(
+  rows: CanvasPresentOptions["dirtyRows"],
+  height: number,
+): readonly number[] | undefined {
+  if (rows === undefined) return undefined;
+  const normalized = new Set<number>();
+  for (const row of rows) {
+    if (!Number.isInteger(row) || row < 0 || row >= height) {
+      throw new RangeError(`canvas dirty row ${String(row)} is outside the frame`);
+    }
+    normalized.add(row);
+  }
+  return [...normalized].sort((left, right) => left - right);
+}
+
+function canvasRowsPatch(
+  frame: CanvasFrame,
+  rows: readonly number[],
+  baseRevision: bigint,
+): CanvasRowsPatch {
+  const runsByRow = new Map<number, CanvasRowRun[]>();
+  for (const row of rows) runsByRow.set(row, []);
+  for (const run of frame.runs) {
+    const selected = runsByRow.get(run.row);
+    if (selected === undefined) continue;
+    selected.push({ column: run.column, text: run.text, style: run.style });
+  }
+  return {
+    baseRevision,
+    width: frame.width,
+    height: frame.height,
+    rows: rows.map((row) => ({ row, runs: runsByRow.get(row) ?? [] })),
+  };
+}
+
+function nextCanvasRevision(revision: bigint): bigint {
+  if (revision >= 0xffff_ffff_ffff_ffffn) {
+    throw new RangeError("canvas revision exceeds u64");
+  }
+  return revision + 1n;
+}
+
 function combineCleanupFailures(first: unknown, second: unknown): unknown {
   if (first === undefined) return second;
   return new AggregateError(
@@ -654,7 +801,7 @@ export function createTui(options: CreateTuiOptions = {}): TuiApp {
   return new TuiApp(options);
 }
 
-function encodeCommand(encoder: PtxPacketEncoder, command: Command): void {
+function encodeCommand(encoder: PtxPacketEncoder, command: Command, protocolFeatures: number): void {
   switch (command.kind) {
     case "createBox":
       encoder.createBox(command.handle, command.options);
@@ -696,7 +843,14 @@ function encodeCommand(encoder: PtxPacketEncoder, command: Command): void {
       encoder.createCanvas(command.handle);
       break;
     case "setCanvasFrame":
-      encoder.setCanvasFrame(command.handle, command.frame);
+      if (
+        command.patch !== undefined &&
+        (protocolFeatures & NATIVE_PROTOCOL_FEATURE_CANVAS_ROWS) !== 0
+      ) {
+        encoder.setCanvasRows(command.handle, command.patch);
+      } else {
+        encoder.setCanvasFrame(command.handle, command.frame);
+      }
       break;
     case "setCursor":
       encoder.setCursor(command.options);

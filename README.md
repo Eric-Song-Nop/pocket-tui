@@ -23,7 +23,7 @@ The MVP is intentionally narrower than the complete design in [`docs/architectur
 
 ### Transactions and terminal
 
-- A versioned, little-endian PTX1 binary transaction format shared by TypeScript and Rust.
+- A versioned, little-endian PTX1 binary transaction format shared by TypeScript and Rust, including revision-guarded whole-row Canvas replacement when both sides advertise support.
 - Semantic operations for scene creation/mutation and transcript create/open/append/seal/mount.
 - An alternate-screen terminal guard that restores terminal modes on close/drop.
 - Separate desired, in-flight, and confirmed terminal state. The confirmed baseline advances only after the complete patch is written.
@@ -36,7 +36,7 @@ The MVP is intentionally narrower than the complete design in [`docs/architectur
 - A bounded incremental decoder: 64 KiB maximum undecoded input and 16 KiB paste chunks by default.
 - A stable N-API v8 boundary for submit/start/flush/readiness/input/stats/close.
 - TypeScript handles for `TuiApp`, `Box`, `Text`, native transcripts, transcript blocks, and virtual transcript views.
-- A fixed-size `CellBuffer` that compacts adjacent equal-style cells into Canvas row runs; Canvas frames stay inside the versioned PTX transaction and native damage pipeline rather than embedding ANSI in strings.
+- A fixed-size `CellBuffer` that compacts adjacent equal-style cells into Canvas row runs; Canvas frames stay inside the versioned PTX transaction and native damage pipeline rather than embedding ANSI in strings. Dirty-row hints use sparse whole-row PTX records only when they are smaller than a full frame, with automatic full-frame fallback for first frames, resizes, dense changes, and older native artifacts.
 - Live viewport dimensions from `TIOCGWINSZ`, resize events coalesced through input polling, a one-million-cell allocation safety limit, and explicit final cursor position/color state for IME- and shader-style integrations.
 - Automatic microtask batching into PTX packets, generation-safe explicit flush/close, native artifact loading, and memory statistics.
 
@@ -159,6 +159,12 @@ canvas.present(cells.frame());
 app.mount(canvas);
 ```
 
+Callers that retain the preceding frame may pass
+`canvas.present(nextFrame, { dirtyRows })`. The hint is a contract: every
+listed row is replaced in full and every omitted row must be unchanged. Core
+uses a revision-checked sparse PTX record only when it is supported and
+strictly smaller than the complete frame.
+
 Explicit `close()` is the correctness path; native drop restoration is a last-resort guard.
 
 ## Repository layout
@@ -183,7 +189,7 @@ docs/pocketjs-backend.md      current backend data path and compatibility limits
 - Transcript indexing is a compact logical-line summary, not the planned width-aware B+ height index. There is no sealed-block compression, disk spill, eviction, or provider reload yet.
 - Transcript lines are tail-clipped to the viewport width rather than fully reflowed into cached wrapped rows.
 - Terminal capabilities are conservative ANSI16 by default and may be set explicitly to truecolor; the flagship demo makes that choice only for its opt-in Ghostty path. Capabilities are not actively probed. Main-screen-safe cursor planning, scroll-operation cost planning, Kitty keyboard, mouse/focus/IME, OSC 8, synchronized-update negotiation, and Kitty/Sixel images remain roadmap work.
-- Resize readiness currently uses a native 250 ms `TIOCGWINSZ` change probe rather than an edge-triggered SIGWINCH producer. Unchanged probes stay entirely native and do not wake JavaScript. PocketJS locally reflows independent absolute subtrees, uses exact cached measurement/geometry for general Flex changes, and commits only touched keys through copy-on-write transaction maps. Cached root passes still scan direct Flex siblings and rasterization still traverses the scene to rebuild paint order. Sparse Canvas patch opcodes remain future work; Canvas still submits bounded full semantic frames before native row damage limits terminal output.
+- Resize readiness currently uses a native 250 ms `TIOCGWINSZ` change probe rather than an edge-triggered SIGWINCH producer. Unchanged probes stay entirely native and do not wake JavaScript. PocketJS locally reflows independent absolute subtrees, uses exact cached measurement/geometry for general Flex changes, and commits only touched keys through copy-on-write transaction maps. Incremental frames cross PTX as revision-guarded whole-row replacements when that record is smaller; first frames, resizes, dense changes, and older native artifacts safely use complete frames. Cached root passes still scan direct Flex siblings, and rasterization still traverses the scene to rebuild paint order and constructs a complete JavaScript `CanvasFrame` before transport selection.
 - Input bytes are still drained on the JavaScript-owned `pollInput()` boundary immediately after a one-shot native readiness signal; completed events are bounded between Pocket frames to 4096 entries and 2 MiB of UTF-8 text, but the planned native event ring is not present yet.
 - PTX currently uses copied `Uint8Array` packets; SharedArrayBuffer transport and the full byte-budgeted scheduler are later milestones.
 - Packaging and automated coverage are still development-grade. `prepack` builds

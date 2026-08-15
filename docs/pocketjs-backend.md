@@ -26,10 +26,10 @@ createNode · insertBefore · setProp · replaceText · setFocus · ...
 validated retained shadow tree · style resolution · cell layout
 viewport raster · ANSI16/truecolor conversion · styled-run compaction
         │
-        │ CanvasFrame (terminal-independent styled row runs)
+        │ CanvasFrame + exact dirty-row hint
         ▼
 @pocket-tui/core CanvasHandle.present()
-        │ PTX1 transaction
+        │ PTX1 full frame or revision-guarded row replacement
         ▼
 Rust SceneDB · grapheme/style catalogs · persistent row damage
         │ minimal terminal transition for the detected damage
@@ -61,9 +61,14 @@ ancestor paths. Layout, flattened-text, measurement, and revision candidates
 use copy-on-write transaction maps: failed presents discard their patches, and
 successful presents apply only touched keys to the last confirmed maps. Those
 same touched keys bound old/new layout damage comparison. Rasterization still
-traverses the full scene to rebuild paint order. Every path submits a complete
-semantic `CanvasFrame`; the Rust renderer compares persistent rows and emits
-only actual terminal damage. There are no sparse Canvas patch opcodes yet.
+traverses the full scene to rebuild paint order and retains a complete semantic
+`CanvasFrame` in JavaScript. Incremental paths also provide the exact dirty-row
+set. Core emits PTX1 whole-row replacements when the native feature bit is
+present and the aligned patch record is smaller than the full record. Each
+patch names the exact retained Canvas revision and dimensions; first frames,
+resizes, dense changes, and older native artifacts fall back to complete
+frames. Rust then compares persistent rows and emits only actual terminal
+damage.
 
 ## Current retained model
 

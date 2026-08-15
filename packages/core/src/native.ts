@@ -44,7 +44,12 @@ export type NativeInputEvent =
 export interface NativeBinding {
   NativeTui: new () => NativeTuiSession;
   nativeVersion(): string;
+  /** Optional bitset keeps newer TypeScript compatible with older artifacts. */
+  protocolFeatures?(): number;
 }
+
+/** Native protocol feature bit for PTX1 SetCanvasRows (opcode 17). */
+export const NATIVE_PROTOCOL_FEATURE_CANVAS_ROWS = 1 << 0;
 
 let cachedBinding: NativeBinding | undefined;
 
@@ -105,7 +110,8 @@ function assertNativeBinding(value: unknown): asserts value is NativeBinding {
     candidate === undefined ||
     typeof candidate !== "object" ||
     typeof candidate.NativeTui !== "function" ||
-    typeof candidate.nativeVersion !== "function"
+    typeof candidate.nativeVersion !== "function" ||
+    (candidate.protocolFeatures !== undefined && typeof candidate.protocolFeatures !== "function")
   ) {
     throw new TypeError("PocketTUI native artifact does not expose the expected N-API surface");
   }

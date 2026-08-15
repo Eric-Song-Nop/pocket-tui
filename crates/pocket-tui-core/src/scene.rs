@@ -1,5 +1,7 @@
 //! Generational scene database for Box and Text primitives.
 
+use std::collections::BTreeMap;
+
 use thiserror::Error;
 
 use crate::{
@@ -274,6 +276,90 @@ impl SceneDb {
         self.mark(id, DirtyReason::CanvasChanged, generation)
     }
 
+    /// Replaces complete rows in a retained canvas without resubmitting the
+    /// rows that did not change.
+    ///
+    /// Sparse updates cannot resize the canvas: `width` and `height` must
+    /// match its retained dimensions. Every listed row replaces all prior
+    /// runs on that row, an empty run list clears it, and omitted rows remain
+    /// untouched. Duplicate rows are resolved deterministically in favor of
+    /// the final entry. Run coordinates are normalized to their enclosing row
+    /// so malformed adapter input cannot escape the requested replacement.
+    pub fn replace_canvas_rows(
+        &mut self,
+        id: NodeId,
+        width: u16,
+        height: u16,
+        rows: Vec<(u16, Vec<CanvasRun>)>,
+    ) -> Result<(), SceneError> {
+        let (retained_width, retained_height) = {
+            let node = self.node(id)?;
+            let NodeKind::Canvas(value) = node.kind() else {
+                return Err(SceneError::WrongKind(id));
+            };
+            (value.width, value.height)
+        };
+        if width != retained_width || height != retained_height {
+            return Err(SceneError::CanvasSizeMismatch {
+                id,
+                retained_width,
+                retained_height,
+                width,
+                height,
+            });
+        }
+
+        // Build and validate the complete patch before mutating retained
+        // state, so one invalid late row cannot partially apply earlier rows.
+        let mut replacements = BTreeMap::<u16, Vec<CanvasRun>>::new();
+        for (row, mut runs) in rows {
+            if row >= height {
+                return Err(SceneError::CanvasRowOutOfBounds { id, row, height });
+            }
+            for run in &mut runs {
+                run.row = row;
+            }
+            replacements.insert(row, runs);
+        }
+        if replacements.is_empty() {
+            return Ok(());
+        }
+
+        // Treat equal per-row content as a semantic no-op even when runs from
+        // different rows happen to be interleaved in the backing vector.
+        {
+            let node = self.node(id)?;
+            let NodeKind::Canvas(value) = node.kind() else {
+                return Err(SceneError::WrongKind(id));
+            };
+            replacements.retain(|row, runs| {
+                !value
+                    .runs
+                    .iter()
+                    .filter(|run| run.row == *row)
+                    .eq(runs.iter())
+            });
+        }
+        if replacements.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let node = self.node_slot_mut(id)?;
+            let NodeKind::Canvas(value) = &mut node.kind else {
+                return Err(SceneError::WrongKind(id));
+            };
+            value
+                .runs
+                .retain(|run| !replacements.contains_key(&run.row));
+            for (_, runs) in replacements {
+                value.runs.extend(runs);
+            }
+        }
+        let generation = self.bump_generation();
+        self.mark(id, DirtyReason::CanvasChanged, generation)
+    }
+
     fn create(&mut self, parent: Option<NodeId>, kind: NodeKind) -> Result<NodeId, SceneError> {
         if let Some(parent) = parent {
             self.node(parent)?;
@@ -526,6 +612,18 @@ pub enum SceneError {
     StaleNode(NodeId),
     #[error("node {0:?} has the wrong primitive kind")]
     WrongKind(NodeId),
+    #[error(
+        "canvas {id:?} has retained size {retained_width}x{retained_height}, not patch size {width}x{height}"
+    )]
+    CanvasSizeMismatch {
+        id: NodeId,
+        retained_width: u16,
+        retained_height: u16,
+        width: u16,
+        height: u16,
+    },
+    #[error("canvas {id:?} row {row} is outside retained height {height}")]
+    CanvasRowOutOfBounds { id: NodeId, row: u16, height: u16 },
     #[error("scene exhausted its 32-bit slot space")]
     Capacity,
 }
@@ -533,6 +631,17 @@ pub enum SceneError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn canvas_run(row: u16, text: &str) -> CanvasRun {
+        CanvasRun {
+            row,
+            column: 0,
+            text: text.to_owned(),
+            foreground: Color::Default,
+            background: Color::Default,
+            attributes: TextAttributes::empty(),
+        }
+    }
 
     #[test]
     fn removed_handle_never_resolves_after_slot_reuse() {
@@ -543,5 +652,106 @@ mod tests {
         assert_eq!(old.index(), new.index());
         assert_ne!(old.generation(), new.generation());
         assert!(scene.node(old).is_err());
+    }
+
+    #[test]
+    fn canvas_row_patch_replaces_clears_and_retains_complete_rows() {
+        let mut scene = SceneDb::default();
+        let canvas = scene
+            .create_canvas(
+                None,
+                CanvasNode {
+                    width: 4,
+                    height: 3,
+                    runs: vec![
+                        canvas_run(0, "zero"),
+                        canvas_run(1, "one"),
+                        canvas_run(2, "old"),
+                    ],
+                    layout: LayoutSpec::FILL,
+                },
+            )
+            .unwrap();
+        scene.clear_dirty();
+
+        // The final duplicate wins, an empty list clears row one, and the
+        // run's own stale row coordinate is normalized to the tuple row.
+        scene
+            .replace_canvas_rows(
+                canvas,
+                4,
+                3,
+                vec![
+                    (1, Vec::new()),
+                    (2, vec![canvas_run(0, "discarded")]),
+                    (2, vec![canvas_run(0, "two")]),
+                ],
+            )
+            .unwrap();
+
+        let node = scene.node(canvas).unwrap();
+        let NodeKind::Canvas(value) = node.kind() else {
+            panic!("expected canvas");
+        };
+        assert_eq!(
+            value.runs,
+            vec![canvas_run(0, "zero"), canvas_run(2, "two")]
+        );
+        assert_eq!(node.dirty().reason(), Some(DirtyReason::CanvasChanged));
+        assert!(node.dirty().mask().contains(DirtyMask::VISUAL));
+
+        scene.clear_dirty();
+        let generation = scene.generation();
+        scene
+            .replace_canvas_rows(
+                canvas,
+                4,
+                3,
+                vec![(1, Vec::new()), (2, vec![canvas_run(99, "two")])],
+            )
+            .unwrap();
+        assert_eq!(scene.generation(), generation);
+        assert!(scene.node(canvas).unwrap().dirty().mask().is_empty());
+    }
+
+    #[test]
+    fn invalid_canvas_row_patch_is_atomic() {
+        let mut scene = SceneDb::default();
+        let canvas = scene
+            .create_canvas(
+                None,
+                CanvasNode {
+                    width: 3,
+                    height: 2,
+                    runs: vec![canvas_run(0, "safe")],
+                    layout: LayoutSpec::FILL,
+                },
+            )
+            .unwrap();
+        scene.clear_dirty();
+        let generation = scene.generation();
+        let before = scene.node(canvas).unwrap().kind().clone();
+
+        assert!(matches!(
+            scene.replace_canvas_rows(canvas, 4, 2, vec![(0, Vec::new())]),
+            Err(SceneError::CanvasSizeMismatch { .. })
+        ));
+        assert!(matches!(
+            scene.replace_canvas_rows(
+                canvas,
+                3,
+                2,
+                vec![(0, Vec::new()), (2, vec![canvas_run(2, "invalid")])],
+            ),
+            Err(SceneError::CanvasRowOutOfBounds {
+                row: 2,
+                height: 2,
+                ..
+            })
+        ));
+
+        assert_eq!(scene.generation(), generation);
+        assert_eq!(scene.node(canvas).unwrap().kind(), &before);
+        assert!(scene.node(canvas).unwrap().dirty().mask().is_empty());
     }
 }
